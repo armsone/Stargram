@@ -199,6 +199,11 @@ struct ExternalAIHiddenAutomatorView: View {
                     if await submitPromptWhenReady() {
                         return
                     }
+                    if bridge.hasAttemptedSubmission {
+                        hasTriggeredFallback = true
+                        onError("전송 뒤 응답 시작을 확인하지 못했어요. 설정의 AI 진단 로그를 공유해 주세요.")
+                        return
+                    }
                 } else if checkCount >= 12 { // 약 8초 동안 입력창 미발견 시 로그인/개입 필요 판단
                     if let reason = bridge.interactionReason {
                         hasTriggeredFallback = true
@@ -230,6 +235,7 @@ struct ExternalAIHiddenAutomatorView: View {
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
+        if !Task.isCancelled, !hasSubmitted { bridge.log("send_timeout") }
         return hasSubmitted
     }
 }
@@ -262,6 +268,7 @@ struct ExternalAIBrowserSheet: View {
     @State private var hasAttemptedAttach = false
     @State private var attachConfirmed = false
     @State private var needsManualAttach = false
+    @State private var refillTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -296,6 +303,7 @@ struct ExternalAIBrowserSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("취소") {
+                        refillTask?.cancel()
                         onDismiss?()
                         dismiss()
                     }
@@ -322,7 +330,8 @@ struct ExternalAIBrowserSheet: View {
                     }
                     Menu {
                         Button {
-                            Task {
+                            refillTask?.cancel()
+                            refillTask = Task {
                                 guard await attachPhotoIfNeeded() else { return }
                                 if await fillPrompt(force: true) {
                                     await submitPromptWhenReady()
@@ -349,12 +358,17 @@ struct ExternalAIBrowserSheet: View {
             .task(id: bridge.navigationGeneration) {
                 await autoFillWhenReady()
             }
+            .onDisappear {
+                refillTask?.cancel()
+                refillTask = nil
+            }
             .onChange(of: bridge.isAnswerStable) { _, stable in
                 guard stable, !bridge.latestAnswer.isEmpty, !hasImported else { return }
                 importAnswer(bridge.latestAnswer)
             }
             .onChange(of: bridge.isGenerating) { _, isGenerating in
                 guard isGenerating, submittedAt == nil else { return }
+                hasSubmittedPrompt = true
                 markSubmitted()
             }
             .onChange(of: bridge.detectedError) { _, error in
@@ -546,8 +560,17 @@ struct ExternalAIBrowserSheet: View {
         let deadline = Date().addingTimeInterval(45)
         while !Task.isCancelled, Date() < deadline, !hasSubmittedPrompt {
             if bridge.isPageReady, await attachPhotoIfNeeded() {
-                if await fillPrompt(force: false) {
+                // 새 요청의 스냅샷은 기존 대화창 초안이나 iOS의 클립보드 제안보다
+                // 항상 우선한다. 사용자가 이미 적어 둔 웹 입력은 이 자동 실행 전에
+                // 만든 내용이므로 이번 요청으로 섞어 보내지 않는다.
+                if await fillPrompt(force: true) {
                     if await submitPromptWhenReady() {
+                        return
+                    }
+                    if bridge.hasAttemptedSubmission {
+                        let message = "전송 뒤 응답 시작을 확인하지 못했어요. 설정의 AI 진단 로그를 공유해 주세요."
+                        detectedErrorMessage = message
+                        onError?(message)
                         return
                     }
                     // ChatGPT가 초기 화면을 늦게 다시 그리면 방금 채운 입력창이 교체되어
@@ -582,6 +605,7 @@ struct ExternalAIBrowserSheet: View {
         }
         if !Task.isCancelled, !hasSubmittedPrompt {
             submitFailed = true
+            bridge.log("send_timeout")
         }
         return hasSubmittedPrompt
     }
@@ -1040,6 +1064,19 @@ final class ExternalAIBrowserBridge: ObservableObject {
     fileprivate weak var webView: WKWebView?
     fileprivate var pendingAttachmentURLs: [URL] = []
     fileprivate var nativeUploadPanelHandled = false
+    private(set) var hasAttemptedSubmission = false
+    private var expectedAttachmentCount = 0
+    fileprivate var diagnosticRunID: UUID?
+    private var lastDiagnosticSnapshot: [String: Int] = [:]
+
+    fileprivate func log(_ event: String, _ metrics: [String: Int] = [:]) {
+        guard let diagnosticRunID else { return }
+        if event == "bridge_snapshot" {
+            guard metrics != lastDiagnosticSnapshot else { return }
+            lastDiagnosticSnapshot = metrics
+        }
+        AIBIDiagnosticsStore.shared.record(runID: diagnosticRunID, event: event, metrics: metrics)
+    }
 
     func checkURLForInteraction(_ urlString: String) {
         if Self.isLoginURL(urlString) {
@@ -1068,13 +1105,14 @@ final class ExternalAIBrowserBridge: ObservableObject {
     /// JavaScript가 실제로 입력창을 채웠는지 여부를 그대로 돌려준다.
     @discardableResult
     func fillPrompt(_ prompt: String, force: Bool) async -> Bool {
-        guard let webView else { return false }
+        guard !Task.isCancelled, let webView, !hasAttemptedSubmission else { return false }
         let literal = ExternalAIBrowserScripts.jsStringLiteral(prompt)
         let script = "window.__starManagerFillPrompt && window.__starManagerFillPrompt(\(literal), \(force));"
         do {
             let result = try await webView.evaluateJavaScript(script)
             let success = Self.boolean(from: result)
             if success {
+                log("prompt_inserted", ["prompt_length": prompt.count])
                 isAnswerStable = false
                 latestAnswer = ""
             }
@@ -1087,7 +1125,9 @@ final class ExternalAIBrowserBridge: ObservableObject {
     /// 선택한 1~8장의 정규화 사본을 한 배치로 연결하고, 미리보기 수가 정확히
     /// 그만큼 늘어난 경우에만 성공한다. 일부 사진만 올라간 상태에서는 전송하지 않는다.
     func attachPhotos(_ attachments: [AIBIMediaAttachment], provider: ExternalAIProvider) async -> Bool {
-        guard let webView, (1...8).contains(attachments.count) else { return false }
+        guard !Task.isCancelled, let webView, (1...8).contains(attachments.count) else { return false }
+        expectedAttachmentCount = attachments.count
+        log("attachment_started", ["expected_count": attachments.count])
         let ordered = attachments.sorted { $0.sourceIndex < $1.sourceIndex }
         guard ordered.map(\.sourceIndex) == Array(0..<ordered.count) else { return false }
         let baseline = await attachmentPreviewCount() ?? 0
@@ -1098,6 +1138,7 @@ final class ExternalAIBrowserBridge: ObservableObject {
                 pendingAttachmentURLs = try makeTemporaryAttachmentFiles(ordered)
                 nativeUploadPanelHandled = false
                 for _ in 0..<4 where !nativeUploadPanelHandled {
+                    guard !Task.isCancelled else { return false }
                     _ = try? await webView.evaluateJavaScript(
                         ExternalAIBrowserScripts.advancePhotoPanelScript(for: provider)
                     )
@@ -1109,6 +1150,7 @@ final class ExternalAIBrowserBridge: ObservableObject {
                     // 전송 확인 전에는 임시 파일을 지우지 않는다.
                     return true
                 }
+                guard !Task.isCancelled else { return false }
                 clearPendingAttachmentFiles()
             } catch {
                 clearPendingAttachmentFiles()
@@ -1116,12 +1158,14 @@ final class ExternalAIBrowserBridge: ObservableObject {
             }
         }
 
+        guard !Task.isCancelled else { return false }
         do {
             let began = try await webView.evaluateJavaScript(
                 "window.__starManagerBeginAttachmentBatch && window.__starManagerBeginAttachmentBatch(\(ordered.count));"
             )
             guard Self.boolean(from: began) else { return false }
             for (index, attachment) in ordered.enumerated() {
+                guard !Task.isCancelled else { return false }
                 let result = try await webView.callAsyncJavaScript(
                     "return window.__starManagerStageAttachment && window.__starManagerStageAttachment(dataURL, mime, index);",
                     arguments: [
@@ -1137,6 +1181,7 @@ final class ExternalAIBrowserBridge: ObservableObject {
                     return false
                 }
             }
+            guard !Task.isCancelled else { return false }
             let committed = try await webView.evaluateJavaScript(
                 "window.__starManagerCommitAttachmentBatch && window.__starManagerCommitAttachmentBatch();"
             )
@@ -1173,9 +1218,14 @@ final class ExternalAIBrowserBridge: ObservableObject {
 
     private func waitForAttachmentCount(_ expectedCount: Int) async -> Bool {
         for _ in 0..<240 {
-            if await attachmentPreviewCount() == expectedCount { return true }
+            if Task.isCancelled { return false }
+            if await attachmentPreviewCount() == expectedCount {
+                log("attachment_ready", ["attached_count": expectedCount])
+                return true
+            }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
+        log("attachment_timeout", ["expected_count": expectedCount])
         return false
     }
 
@@ -1207,18 +1257,29 @@ final class ExternalAIBrowserBridge: ObservableObject {
     }
 
     func submitPrompt() async -> Bool {
-        guard let webView else { return false }
+        guard !Task.isCancelled, let webView else { return false }
         do {
-            let attempted = try await webView.evaluateJavaScript(
-                "window.__starManagerSendPrompt && window.__starManagerSendPrompt();"
-            )
-            guard Self.boolean(from: attempted) else { return false }
+            if !hasAttemptedSubmission {
+                let attachmentsReady = expectedAttachmentCount == 0 ? true : await isAttachmentCountConfirmed(expectedAttachmentCount)
+                guard attachmentsReady else {
+                    log("send_blocked", ["expected_count": expectedAttachmentCount, "attachment_verified": 0])
+                    return false
+                }
+                guard !Task.isCancelled else { return false }
+                let attempted = try await webView.evaluateJavaScript(
+                    "window.__starManagerSendPrompt && window.__starManagerSendPrompt();"
+                )
+                guard Self.boolean(from: attempted) else { return false }
+                hasAttemptedSubmission = true
+                log("send_attempted", ["attempt": 1])
+            }
             try? await Task.sleep(nanoseconds: 700_000_000)
             let verified = try await webView.evaluateJavaScript(
                 "window.__starManagerDidSubmit && window.__starManagerDidSubmit();"
             )
             let didSubmit = Self.boolean(from: verified)
             if didSubmit {
+                log("send_observed")
                 // 자동 입력 뒤 웹 입력창이 첫 응답자로 남으면 전체 화면 위에 iOS의
                 // 이전/다음/완료 입력 보조 막대가 나타난다. 전송 확인 직후 포커스를 끊는다.
                 _ = try? await webView.evaluateJavaScript(
@@ -1226,10 +1287,10 @@ final class ExternalAIBrowserBridge: ObservableObject {
                 )
                 webView.endEditing(true)
                 webView.resignFirstResponder()
-                clearPendingAttachmentFiles()
             }
             return didSubmit
         } catch {
+            log("bridge_failed")
             return false
         }
     }
@@ -1240,7 +1301,8 @@ final class ExternalAIBrowserBridge: ObservableObject {
     }
 
     fileprivate func resetForNewNavigation() {
-        clearPendingAttachmentFiles()
+        // ChatGPT can create the conversation URL before it has finished reading the selected
+        // files. The coordinator releases these files only when this task's WebView ends.
         nativeUploadPanelHandled = false
         isPageReady = false
         isGenerating = false
@@ -1250,11 +1312,15 @@ final class ExternalAIBrowserBridge: ObservableObject {
     }
 
     fileprivate func markNavigationFinished() {
+        log("browser_loaded")
         isPageReady = true
         navigationGeneration += 1
     }
 
     fileprivate func receive(text: String, stable: Bool, generating: Bool, interaction: String = "none", error: String = "") {
+        if generating && !isGenerating { log("generation_started") }
+        if stable && !text.isEmpty && !isAnswerStable { log("generation_completed", ["response_length": text.count]) }
+        if !error.isEmpty && detectedError == nil { log("generation_failed") }
         isGenerating = generating
         if !text.isEmpty { latestAnswer = text }
         isAnswerStable = stable && !text.isEmpty
@@ -1320,6 +1386,9 @@ private struct ExternalAIWebView: UIViewRepresentable {
 
         let controller = WKUserContentController()
         controller.add(context.coordinator, name: "starManagerBridge")
+        bridge.diagnosticRunID = AIBIDiagnosticsStore.shared.currentRunID
+            ?? AIBIDiagnosticsStore.shared.start(provider: provider.rawValue)
+        controller.addUserScript(WKUserScript(source: ExternalAIBrowserScripts.uploadDiagnostics, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         controller.addUserScript(WKUserScript(
             source: ExternalAIBrowserScripts.observerScript(for: provider),
             injectionTime: .atDocumentEnd,
@@ -1372,6 +1441,7 @@ private struct ExternalAIWebView: UIViewRepresentable {
                 return
             }
             bridge.nativeUploadPanelHandled = true
+            bridge.log("attachment_dispatched", ["attached_count": fileURLs.count])
             completionHandler(fileURLs)
         }
 
@@ -1418,6 +1488,11 @@ private struct ExternalAIWebView: UIViewRepresentable {
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             guard message.name == "starManagerBridge", let body = message.body as? [String: Any] else { return }
+            if let event = body["diagnosticEvent"] as? String {
+                let metrics = (body["metrics"] as? [String: Int]) ?? [:]
+                bridge.log(event, metrics)
+                return
+            }
             let text = (body["text"] as? String) ?? ""
             let stable = (body["stable"] as? Bool) ?? false
             let generating = (body["generating"] as? Bool) ?? false
@@ -1441,6 +1516,53 @@ private extension ExternalAIProvider {
 
 /// 제공사별 DOM 구조가 바뀌어도 최대한 버티도록 여러 선택자를 순서대로 시도하는 주입/감시 스크립트.
 private enum ExternalAIBrowserScripts {
+    static let uploadDiagnostics = """
+    (() => {
+      if (location.hostname !== 'chatgpt.com') return;
+      const emit = (event, metrics) => {
+        try { window.webkit.messageHandlers.starManagerBridge.postMessage({diagnosticEvent:event, metrics:metrics}); } catch (_) {}
+      };
+      const category = value => {
+        try {
+          const u = new URL(typeof value === 'string' || value instanceof URL ? value : value.url, location.href);
+          if (/conversation/.test(u.pathname)) return 2;
+          if (/upload|files|estuary/.test(u.pathname) || /oaiusercontent|blob.core/.test(u.hostname)) return 1;
+        } catch (_) {}
+        return 0;
+      };
+      const original = window.fetch;
+      let requestSequence = 0;
+      window.fetch = async function(resource, options) {
+        const kind = category(resource);
+        const requestID = kind ? Math.min(1000, ++requestSequence) : 0;
+        if (kind) {
+          let imageCount = 0;
+          let hasMessages = 0;
+          if (typeof options?.body === 'string') {
+            try {
+              const body = JSON.parse(options.body);
+              hasMessages = Array.isArray(body.messages) ? 1 : 0;
+              const walk = (x, depth) => {
+                if (!x || typeof x !== 'object' || depth > 12) return;
+                if (x.content_type === 'image_asset_pointer') imageCount++;
+                for (const value of Object.values(x)) if (value && typeof value === 'object') walk(value, depth + 1);
+              };
+              walk(body, 0);
+            } catch (_) {}
+          }
+          emit('request_started', {request_id:requestID,request_kind:kind,request_has_messages:hasMessages,image_count:Math.min(100,imageCount)});
+        }
+        try {
+          const response = await original.apply(this, arguments);
+          if (kind) emit('request_response', {request_id:requestID,request_kind:kind,http_status:response.status});
+          return response;
+        } catch(error) {
+          if (kind) emit('request_failed', {request_id:requestID,request_kind:kind,failure_kind:error?.name === 'AbortError' ? 1 : error?.name === 'TypeError' ? 2 : 3});
+          throw error;
+        }
+      };
+    })();
+    """
     static func jsStringLiteral(_ text: String) -> String {
         guard let data = try? JSONEncoder().encode(text),
               let literal = String(data: data, encoding: .utf8) else {
@@ -1542,6 +1664,35 @@ private enum ExternalAIBrowserScripts {
         let menuSelectors: [String]
         let menuTexts: [String]
         switch provider {
+        case .openAI:
+            // ChatGPT의 현재 모바일 웹 작성기는 + 버튼을 누른 뒤
+            // `Add photos & files` 메뉴를 한 번 더 선택해야 파일 입력창을 연다.
+            // 이전에는 Gemini만 이 중첩 메뉴를 처리해서 ChatGPT에서는 + 메뉴만
+            // 열리고 사진 선택 패널까지 도달하지 못했다.
+            menuSelectors = [
+                "button[data-testid='upload-file-button']",
+                "[data-testid='upload-file-button']",
+                "button[data-testid*='upload-file']",
+                "[role='menuitem'][data-testid*='upload-file']",
+                "button[aria-label*='Add photos & files' i]",
+                "[role='menuitem'][aria-label*='Add photos & files' i]",
+                "button[aria-label*='사진 및 파일' i]",
+                "[role='menuitem'][aria-label*='사진 및 파일' i]"
+            ]
+            menuTexts = [
+                "Add photos & files",
+                "Upload files",
+                "Upload from device",
+                "사진 및 파일 추가",
+                "사진과 파일 추가",
+                // 현재 한국어 ChatGPT iPhone 작성기 메뉴의 실제 항목은 단순히
+                // `사진`이다. 이 항목을 놓치면 + 메뉴만 열린 채 업로드 패널로
+                // 진행하지 못한다.
+                "사진",
+                "사진 추가",
+                "Photos",
+                "파일 업로드"
+            ]
         case .gemini:
             menuSelectors = [
                 "button[aria-label='파일']",
@@ -1561,6 +1712,7 @@ private enum ExternalAIBrowserScripts {
           const fileSelectors = \(jsArray(config.fileInput));
           const triggerSelectors = \(jsArray(config.attachTrigger));
           const menuSelectors = \(jsArray(menuSelectors));
+          const requiresAttachmentMenu = \(provider == .openAI ? "true" : "false");
           const menuTexts = new Set(\(jsArray(menuTexts)).map(function(value) {
             return value.trim().toLocaleLowerCase();
           }));
@@ -1582,15 +1734,13 @@ private enum ExternalAIBrowserScripts {
             return null;
           }
 
-          const input = first(fileSelectors, false);
-          if (input) { input.click(); return 'input'; }
-
-          let menuAction = first(menuSelectors, true);
-          if (!menuAction && menuTexts.size > 0) {
+          function menuAction() {
+            let action = first(menuSelectors, true);
+            if (action || menuTexts.size === 0) return action;
             const candidates = document.querySelectorAll(
               "button, [role='menuitem'], [role='option'], [mat-menu-item], [data-test-id]"
             );
-            menuAction = Array.from(candidates).find(function(element) {
+            return Array.from(candidates).find(function(element) {
               if (!visible(element)) return false;
               const values = [
                 element.getAttribute('aria-label'),
@@ -1599,11 +1749,30 @@ private enum ExternalAIBrowserScripts {
                 element.textContent
               ];
               return values.some(function(value) {
-                return value && menuTexts.has(value.trim().toLocaleLowerCase());
+                if (!value) return false;
+                const normalized = value.trim().toLocaleLowerCase();
+                return Array.from(menuTexts).some(function(menuText) {
+                  return normalized === menuText || normalized.includes(menuText);
+                });
               });
             }) || null;
           }
-          if (menuAction) { menuAction.click(); return 'menu-action'; }
+
+          // ChatGPT는 숨겨진 file input을 먼저 누르면 iOS WKWebView가 선택 패널을
+          // 열지 않는 경우가 있다. 공식 흐름 그대로 + → Add photos & files를 먼저
+          // 진행한 뒤, 그 메뉴가 만든 file input을 누른다.
+          if (requiresAttachmentMenu) {
+            const action = menuAction();
+            if (action) { action.click(); return 'menu-action'; }
+            const trigger = first(triggerSelectors, true);
+            if (trigger) { trigger.click(); return 'trigger'; }
+          }
+
+          const input = first(fileSelectors, false);
+          if (input) { input.click(); return 'input'; }
+
+          const action = menuAction();
+          if (action) { action.click(); return 'menu-action'; }
 
           const trigger = first(triggerSelectors, true);
           if (trigger) { trigger.click(); return 'trigger'; }
@@ -1669,7 +1838,27 @@ private enum ExternalAIBrowserScripts {
           }
 
           function isGeneratingNow() {
-            return queryAll(generatingSelectors).some(isVisible);
+            return generatingSelectors.some(function(selector) {
+              try { return Array.from(document.querySelectorAll(selector)).some(isVisible); } catch (_) { return false; }
+            });
+          }
+
+          function composerScope() {
+            const input = queryFirst(inputSelectors);
+            return input && (input.closest('form') || input.parentElement?.parentElement?.parentElement);
+          }
+
+          function sendButton() {
+            const scope = composerScope();
+            if (!scope) return null;
+            for (const selector of sendSelectors) {
+              for (const button of scope.querySelectorAll(selector)) {
+                const meaning = ((button.getAttribute('aria-label') || '') + ' ' + (button.getAttribute('data-testid') || '')).toLowerCase();
+                if (/stop|중지|정지|voice|음성/.test(meaning)) continue;
+                if (isVisible(button)) return button;
+              }
+            }
+            return null;
           }
 
           function extractAnswerText(element) {
@@ -1683,7 +1872,13 @@ private enum ExternalAIBrowserScripts {
           }
 
           function attachmentCount() {
-            return queryAll(attachmentConfirmedSelectors).filter(isVisible).length;
+            const scope = composerScope();
+            if (!scope) return 0;
+            for (const selector of attachmentConfirmedSelectors) {
+              const matches = Array.from(scope.querySelectorAll(selector)).filter(isVisible);
+              if (matches.length) return matches.length;
+            }
+            return 0;
           }
 
           function fileFromDataURL(dataURL, mime, filename) {
@@ -1752,6 +1947,7 @@ private enum ExternalAIBrowserScripts {
           // force가 false일 때는 사용자가 우리가 넣은 것과 다른 내용을 이미 입력해 두었다면
           // 덮어쓰지 않는다(자동 채우기가 사용자 편집을 방해하지 않도록).
           window.__starManagerFillPrompt = function(text, force) {
+            if (window.__starManagerSubmitDispatched) return false;
             const el = queryFirst(inputSelectors);
             if (!el) return false;
             const isTextField = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
@@ -1796,9 +1992,16 @@ private enum ExternalAIBrowserScripts {
           };
 
           window.__starManagerSendPrompt = function() {
+            // The same DOM button may become Stop after the first click. Never click it
+            // again while waiting for proof, and never turn a consumed image request into text-only.
+            if (window.__starManagerSubmitDispatched) return true;
+            if (isGeneratingNow()) return false;
             const input = queryFirst(inputSelectors);
-            const button = queryFirst(sendSelectors);
+            const button = sendButton();
             if (!input || !button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+            const normalize = value => value.replace(/\\s+/g, ' ').trim();
+            const current = normalize(input.value || input.innerText || input.textContent || '');
+            if (!current || current !== normalize(window.__starManagerLastFilled || '')) return false;
             const rect = button.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return false;
 
@@ -1808,38 +2011,19 @@ private enum ExternalAIBrowserScripts {
               window.__starManagerCaptureBaseline();
               window.__starManagerBaselineCapturedForSubmit = true;
             }
+            window.__starManagerSubmitDispatched = true;
             input.focus();
-
-            if (attempt === 1) {
-              button.focus();
-              button.click();
-            } else if (attempt === 2) {
-              button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'touch' }));
-              button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'touch' }));
-              button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-            } else if (attempt === 3) {
-              const form = input.closest('form') || button.closest('form');
-              if (form && typeof form.requestSubmit === 'function') {
-                form.requestSubmit(button);
-              }
-            } else {
-              ['keydown', 'keypress', 'keyup'].forEach(function(type) {
-                input.dispatchEvent(new KeyboardEvent(type, {
-                  key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
-                  bubbles: true, cancelable: true
-                }));
-              });
-            }
+            button.focus();
+            button.click();
             return true;
           };
 
           window.__starManagerDidSubmit = function() {
-            const el = queryFirst(inputSelectors);
-            const isTextField = el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT');
-            const current = el ? (isTextField ? el.value : (el.innerText || el.textContent || '')).trim() : '';
+            // A consumed composer is only pending, not evidence that the service began
+            // answering. The caller observes this state without another click or refill.
             const answerStarted = queryAll(assistantSelectors).length > baselineCount;
             const generating = isGeneratingNow();
-            return (!!el && current.length === 0) || answerStarted || generating;
+            return answerStarted || generating;
           };
 
           function detectInteraction() {
@@ -1903,12 +2087,26 @@ private enum ExternalAIBrowserScripts {
               ? (latest.getAttribute('data-message-id') || latest.getAttribute('data-testid') || latest.id || '')
               : '';
             lastText = '';
-            stableCount = 0;
+            stableTicks = 0;
           };
           let lastText = '';
           let stableTicks = 0;
 
           setInterval(function() {
+            const editor = queryFirst(inputSelectors);
+            const scope = composerScope();
+            const send = sendButton();
+            window.webkit.messageHandlers.starManagerBridge.postMessage({diagnosticEvent:'bridge_snapshot', metrics: {
+              preview_count: attachmentCount(), input_count: document.querySelectorAll('input[type=file]').length,
+              uploading_count: scope ? Array.from(scope.querySelectorAll('[role=progressbar], [aria-busy=true], .animate-spin')).filter(isVisible).length : 0,
+              composer_present: editor ? 1 : 0, send_present: send ? 1 : 0,
+              send_enabled: send && !send.disabled && send.getAttribute('aria-disabled') !== 'true' ? 1 : 0,
+              prompt_length: editor ? (editor.value || editor.textContent || '').length : 0,
+              user_message_present: document.querySelector('[data-message-author-role=user]') ? 1 : 0,
+              assistant_message_present: queryAll(assistantSelectors).length ? 1 : 0,
+              generation_active: isGeneratingNow() ? 1 : 0,
+              stop_present: isGeneratingNow() ? 1 : 0
+            }});
             const items = queryAll(assistantSelectors);
             // Gemini는 답변 완료 뒤에도 숨겨진 mat-progress-spinner를 DOM에 남겨 둔다.
             // 실제로 보이는 생성 표시만 검사해야 완료된 응답을 정상적으로 가져올 수 있다.

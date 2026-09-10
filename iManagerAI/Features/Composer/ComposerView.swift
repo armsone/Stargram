@@ -64,6 +64,9 @@ struct ComposerView: View {
     @State private var showsResetConfirmation = false
     @State private var resetScrollRequest = UUID()
     @State private var activePhotoAttachments: [AIBIMediaAttachment] = []
+    /// 외부 AI를 누른 순간의 문구를 고정한다. 이후 클립보드나 편집 화면의 변화가
+    /// 현재 요청에 섞이지 않도록, 브라우저에는 이 스냅샷만 전달한다.
+    @State private var activeExternalPrompt = ""
     @State private var externalAttachmentPreparationTask: Task<Void, Never>?
     @State private var isPreparingExternalAttachments = false
     @State private var sparklesRotationAngle: Double = 0
@@ -95,6 +98,7 @@ struct ComposerView: View {
                 .padding(.vertical, horizontalSizeClass == .regular ? 20 : 12)
                 .frame(maxWidth: .infinity)
             }
+            .contentMargins(.bottom, 96, for: .scrollContent)
             .scrollDismissesKeyboard(.immediately)
             .onScrollPhaseChange { _, newPhase in
                 guard newPhase == .interacting else { return }
@@ -145,7 +149,7 @@ struct ComposerView: View {
                !isPreparingExternalAttachments {
                 ExternalAIHiddenAutomatorView(
                     provider: provider,
-                    prompt: externalPrompt,
+                    prompt: activeExternalPrompt,
                     attachments: activePhotoAttachments,
                     generationID: generationID,
                     onSubmitted: { date in
@@ -159,9 +163,11 @@ struct ComposerView: View {
                         importAIResult(text, from: provider)
                     },
                     onFallback: { reason in
+                        recordAIDiagnostic("manual_takeover")
                         browserContext = ExternalAIBrowserContext(provider: provider, fallbackReason: reason)
                     },
                     onError: { err in
+                        recordAIDiagnostic("run_failed")
                         errorMessage = err
                         activeExternalProvider = nil
                         externalSubmittedAt = nil
@@ -301,7 +307,7 @@ struct ComposerView: View {
         .fullScreenCover(item: $browserContext) { context in
             ExternalAIBrowserSheet(
                 provider: context.provider,
-                prompt: externalPrompt,
+                prompt: activeExternalPrompt,
                 attachments: activePhotoAttachments,
                 fallbackReason: context.fallbackReason,
                 onSubmitted: { date in
@@ -312,6 +318,7 @@ struct ComposerView: View {
                     dismissKeyboardAfterAutomationSubmission()
                 },
                 onError: { message in
+                    recordAIDiagnostic("run_failed")
                     errorMessage = message
                     externalSubmittedAt = nil
                     elapsedSeconds = 0
@@ -335,6 +342,7 @@ struct ComposerView: View {
                 },
                 onDismiss: {
                     if isGenerating {
+                        recordAIDiagnostic("run_cancelled")
                         isGenerating = false
                         activeExternalProvider = nil
                         activePhotoAttachments = []
@@ -985,6 +993,7 @@ struct ComposerView: View {
 
     @MainActor
     private func cancelExternalGeneration() {
+        recordAIDiagnostic("run_cancelled")
         externalAttachmentPreparationTask?.cancel()
         externalAttachmentPreparationTask = nil
         generationID = nil
@@ -1002,6 +1011,8 @@ struct ComposerView: View {
 
     @MainActor
     private func timeoutExternalGeneration() {
+        recordAIDiagnostic("generation_failed")
+        recordAIDiagnostic("run_failed")
         externalAttachmentPreparationTask?.cancel()
         externalAttachmentPreparationTask = nil
         generationID = nil
@@ -1016,6 +1027,13 @@ struct ComposerView: View {
         errorMessage = message
         if isAutomationSessionActive {
             automationSurfaceState = .failure(message)
+        }
+    }
+
+    @MainActor
+    private func recordAIDiagnostic(_ event: String) {
+        if let runID = AIBIDiagnosticsStore.shared.currentRunID {
+            AIBIDiagnosticsStore.shared.record(runID: runID, event: event)
         }
     }
 
@@ -1040,6 +1058,7 @@ struct ComposerView: View {
             return
         }
         let requestID = UUID()
+        let diagnosticID = AIBIDiagnosticsStore.shared.start(provider: provider.rawValue)
         generationID = requestID
         isGenerating = true
         activeExternalProvider = provider
@@ -1055,10 +1074,12 @@ struct ComposerView: View {
         generatedSignature = nil
         activeCaptionSource = nil
         activePhotoAttachments = []
+        activeExternalPrompt = externalPrompt
 
         let sourceImages = mediaItems
             .filter { $0.kind == .image }
             .map(\.data)
+        AIBIDiagnosticsStore.shared.record(runID: diagnosticID, event: "media_preparation_started", metrics: ["expected_count": sourceImages.count])
         guard !sourceImages.isEmpty else {
             isPreparingExternalAttachments = false
             if showsExternalAIBrowser {
@@ -1087,6 +1108,7 @@ struct ComposerView: View {
             externalAttachmentPreparationTask = nil
             isPreparingExternalAttachments = false
             guard let prepared, prepared.count == sourceImages.count else {
+                AIBIDiagnosticsStore.shared.record(runID: diagnosticID, event: "media_preparation_failed")
                 let message = "선택한 사진을 전송용으로 준비하지 못했어요. 사진을 확인하고 다시 시도해 주세요."
                 errorMessage = message
                 activeExternalProvider = nil
@@ -1099,6 +1121,8 @@ struct ComposerView: View {
                 return
             }
             activePhotoAttachments = prepared
+            AIBIDiagnosticsStore.shared.record(runID: diagnosticID, event: "media_prepared", metrics: ["prepared_count": prepared.count, "total_bytes": prepared.reduce(0) { $0 + $1.data.count }])
+            activeExternalPrompt = externalPrompt
             statusMessage = "사진 \(prepared.count)장을 \(provider.title)에 연결하는 중…"
             automationRelayState = .sending
             if showsExternalAIBrowser {
@@ -1362,6 +1386,10 @@ struct ComposerView: View {
             return
         }
         isIdeaFocused = false
+        if let diagnosticID = AIBIDiagnosticsStore.shared.currentRunID {
+            AIBIDiagnosticsStore.shared.record(runID: diagnosticID, event: "result_applied", metrics: ["response_length": text.count])
+            AIBIDiagnosticsStore.shared.record(runID: diagnosticID, event: "run_completed")
+        }
         let signature = currentDraftSignature
         let lines = text.components(separatedBy: "\n")
         let hashtags = (lines.first ?? "").split(separator: " ").compactMap { token -> String? in
@@ -1445,6 +1473,7 @@ struct ComposerView: View {
         externalAttachmentPreparationTask?.cancel()
         externalAttachmentPreparationTask = nil
         activePhotoAttachments = []
+        activeExternalPrompt = ""
         isPreparingExternalAttachments = false
         isAutomationSessionActive = false
         automationSurfaceState = .processing

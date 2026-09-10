@@ -13,8 +13,25 @@
           "source": "profiles/imanagerai/distribution/ios/ExternalAIBrowserView.swift"
         }
       }
+    },
+    "imanager-ios": {
+      "version": "0.5.0",
+      "files": {
+        "iManagerAI/Features/Composer/AIBIMediaPipeline.swift": {
+          "sha256": "8e9c934a73bd0a2bc06676e532cdd23dc0a320d96c9cdf922af813668c946dc7",
+          "source": "profiles/imanager/distribution/ios/AIBIMediaPipeline.swift"
+        },
+        "iManagerAI/Features/Composer/ExternalAIBrowserView.swift": {
+          "sha256": "7fe2123e0da91eedf917d3808d3db220b3585e64bb6c281a53a1dc8ba45516d9",
+          "source": "profiles/imanager/distribution/ios/ExternalAIBrowserView.swift"
+        },
+        "iManagerAI/Services/AIBIDiagnosticsStore.swift": {
+          "sha256": "647cd0e078c6bf43ac4f72a3566d8bcec86670e5dd54fb34563b06b80e19ca50",
+          "source": "profiles/imanager/distribution/ios/AIBIDiagnosticsStore.swift"
+        }
+      }
     }
   },
-  "consumer": "imanagerai",
-  "aibiVersion": "0.4.4"
+  "consumer": "imanager",
+  "aibiVersion": "0.5.0"
 }

@@ -11,6 +11,7 @@ struct ProfileSettingsView: View {
     @AppStorage(SharedGenerationSettings.showsExternalAIBrowserKey) private var showsExternalAIBrowser = false
     @State private var loginProvider: ExternalAIProvider?
     @StateObject private var loginStatusStore = ExternalAILoginStatusStore()
+    @ObservedObject private var diagnosticsStore = AIBIDiagnosticsStore.shared
 
     var body: some View {
         Form {
@@ -78,6 +79,26 @@ struct ProfileSettingsView: View {
             }
 
             Section {
+                if let url = diagnosticsStore.exportURL {
+                    ShareLink(item: url) {
+                        Label("최근 진단 로그 공유", systemImage: "square.and.arrow.up")
+                    }
+                } else if diagnosticsStore.storageError == nil {
+                    Text("AI를 실행하면 진단 로그가 생겨요.")
+                        .foregroundStyle(.secondary)
+                }
+                if let error = diagnosticsStore.storageError {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                BrandSectionTitle(title: "AI 진단 로그", systemImage: "doc.text.magnifyingglass")
+            } footer: {
+                Text("최근 10회 실행의 단계·소요 시간·첨부 및 전송 상태와 앱·연결 방식 버전을 기기에 보관해요. 사진, 입력한 글, AI 답변, 계정 정보는 기록하지 않아요. 직접 공유할 때만 로그 파일을 전달합니다.")
+            }
+
+            Section {
                 LabeledContent("현재 버전") {
                     Text(Self.appVersionText)
                         .foregroundStyle(.secondary)
@@ -110,6 +131,9 @@ struct ProfileSettingsView: View {
         }
         .frame(maxWidth: 760)
         .frame(maxWidth: .infinity)
+        // ContentView reserves the bar's safe area for its child, but Form's scroll content
+        // needs its own terminal margin to stop above the floating controls.
+        .contentMargins(.bottom, 96, for: .scrollContent)
         .scrollContentBackground(.hidden)
         .background(theme.canvasGradient)
         .background(
