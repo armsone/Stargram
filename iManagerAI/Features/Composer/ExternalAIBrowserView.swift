@@ -160,14 +160,17 @@ struct ExternalAIHiddenAutomatorView: View {
             // 제공사 웹앱이 이전 실패 초안과 첨부 카드를 로컬 세션에 복원할 수 있다.
             // 이번 자동화 입력을 넣기 전에 반드시 깨끗한 작성창으로 만든다.
             if bridge.isPageReady, !hasPreparedFreshComposer {
+                guard !hasAttemptedAttach else { return }
                 var prepared = false
-                for _ in 0..<8 where !prepared {
+                for _ in 0..<8 where !prepared && !Task.isCancelled {
                     prepared = await bridge.prepareFreshComposer(for: provider)
-                    if !prepared { try? await Task.sleep(nanoseconds: 300_000_000) }
+                    if !prepared && !Task.isCancelled { try? await Task.sleep(nanoseconds: 300_000_000) }
                 }
-                guard prepared else {
-                    hasTriggeredFallback = true
-                    onFallback(.interaction)
+                guard !Task.isCancelled, prepared else {
+                    if !Task.isCancelled {
+                        hasTriggeredFallback = true
+                        onFallback(.interaction)
+                    }
                     return
                 }
                 hasPreparedFreshComposer = true
@@ -268,7 +271,18 @@ struct ExternalAIBrowserSheet: View {
     @State private var hasAttemptedAttach = false
     @State private var attachConfirmed = false
     @State private var needsManualAttach = false
+    @State private var composerPreparation: ComposerPreparation = .notStarted
     @State private var refillTask: Task<Void, Never>?
+
+    /// 첫 자동 첨부 직전에 한 번만 수행하는 작성창 정리 상태.
+    /// `.inProgress`는 await 이전에 표시해 다른 내비게이션 콜백이나 수동 다시 넣기가
+    /// 아직 끝나지 않은 정리를 건너뛰고 첨부하지 못하게 막는다.
+    private enum ComposerPreparation {
+        case notStarted
+        case inProgress
+        case prepared
+        case failed
+    }
 
     var body: some View {
         NavigationStack {
@@ -540,6 +554,10 @@ struct ExternalAIBrowserSheet: View {
         guard !attachments.isEmpty else { return true }
         if attachConfirmed { return true }
         if !hasAttemptedAttach {
+            // 제공사 웹앱이 이전에 취소된 첨부 카드를 로컬 세션에 복원할 수 있다.
+            // 첫 자동 첨부 전에 딱 한 번 작성창을 비우고, 실패하면 첨부와 전송을 막는다.
+            guard await prepareComposerBeforeFirstAttach() else { return false }
+            guard !Task.isCancelled, bridge.isPageReady, !hasSubmittedPrompt, !hasAttemptedAttach else { return false }
             hasAttemptedAttach = true
             attachConfirmed = await bridge.attachPhotos(attachments, provider: provider)
             if !attachConfirmed {
@@ -553,12 +571,51 @@ struct ExternalAIBrowserSheet: View {
         return attachConfirmed
     }
 
+    /// 첫 자동 첨부 직전에만 작성창을 정리한다(최대 8회 재시도). 이미 정리했거나 첨부를 시도한 뒤에는
+    /// 다시 실행하지 않아 사용자의 수동 편집과 직접 첨부를 건드리지 않는다.
+    /// 정리 도중 취소되어도 같은 작업에서 초기화를 반복하지 않는다.
+    private func prepareComposerBeforeFirstAttach() async -> Bool {
+        guard !hasAttemptedAttach else { return false }
+        switch composerPreparation {
+        case .prepared:
+            return true
+        case .inProgress, .failed:
+            return false
+        case .notStarted:
+            break
+        }
+        composerPreparation = .inProgress
+        var prepared = false
+        for _ in 0..<8 where !prepared && !Task.isCancelled {
+            prepared = await bridge.prepareFreshComposer(for: provider)
+            if !prepared && !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+        }
+        if Task.isCancelled {
+            composerPreparation = prepared ? .prepared : .failed
+            return false
+        }
+        guard prepared else {
+            composerPreparation = .failed
+            bridge.log("attachment_failed", ["expected_count": attachments.count])
+            let message = "이전 첨부를 정리하지 못해 자동 첨부와 전송을 멈췄어요. 다시 시도해 주세요."
+            detectedErrorMessage = message
+            onError?(message)
+            return false
+        }
+        composerPreparation = .prepared
+        return true
+    }
+
     private func autoFillWhenReady() async {
         guard !hasSubmittedPrompt else { return }
         isAutoFilling = true
         defer { isAutoFilling = false }
         let deadline = Date().addingTimeInterval(45)
         while !Task.isCancelled, Date() < deadline, !hasSubmittedPrompt {
+            // 작성창 정리에 실패하면 새 요청을 첨부하거나 보내지 않고 자동 실행을 끝낸다.
+            if composerPreparation == .failed { return }
             if bridge.isPageReady, await attachPhotoIfNeeded() {
                 // 새 요청의 스냅샷은 기존 대화창 초안이나 iOS의 클립보드 제안보다
                 // 항상 우선한다. 사용자가 이미 적어 둔 웹 입력은 이 자동 실행 전에
@@ -1235,11 +1292,31 @@ final class ExternalAIBrowserBridge: ObservableObject {
 
     /// 이전 자동화에서 남은 문구와 실패/대기 첨부 카드를 제거한다.
     func prepareFreshComposer(for provider: ExternalAIProvider) async -> Bool {
-        guard let webView else { return false }
-        _ = try? await webView.evaluateJavaScript(
-            ExternalAIBrowserScripts.resetComposerScript(for: provider)
-        )
+        guard !Task.isCancelled, let webView else { return false }
+        var resetMetrics: [String: Int] = [
+            "composer_ready": 0, "root_present": 0, "reset_tiles": 0, "reset_clicks": 0, "reset_error": 3
+        ]
+        do {
+            let result = try await webView.evaluateJavaScript(
+                ExternalAIBrowserScripts.resetComposerScript(for: provider)
+            )
+            if let dictionary = result as? [String: Any] {
+                var parsed: [String: Int] = [:]
+                for key in ["composer_ready", "root_present", "reset_tiles", "reset_clicks", "reset_error"] {
+                    if let number = dictionary[key] as? NSNumber { parsed[key] = number.intValue }
+                }
+                if parsed.count == 5 { resetMetrics = parsed }
+            }
+        } catch {
+        }
+        log("composer_reset", resetMetrics)
+        guard !Task.isCancelled,
+              resetMetrics["composer_ready"] == 1,
+              resetMetrics["reset_error"] == 0 else {
+            return false
+        }
         try? await Task.sleep(nanoseconds: 180_000_000)
+        guard !Task.isCancelled else { return false }
         return await attachmentPreviewCount() == 0
     }
 
@@ -1575,62 +1652,120 @@ private enum ExternalAIBrowserScripts {
         let config = selectors(for: provider)
         return """
         (function() {
+          const metrics = { composer_ready: 0, root_present: 0, reset_tiles: 0, reset_clicks: 0, reset_error: 0 };
+          try {
           const inputSelectors = \(jsArray(config.input));
           const attachmentSelectors = \(jsArray(config.attachmentConfirmed));
 
-          function first(selectors) {
+          function isVisible(element) {
+            if (!element) return false;
+            const style = window.getComputedStyle(element);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            return element.getClientRects().length > 0;
+          }
+
+          function firstVisible(selectors) {
             for (const selector of selectors) {
               try {
-                const element = document.querySelector(selector);
-                if (element) return element;
+                for (const element of document.querySelectorAll(selector)) {
+                  if (element && element.isConnected && isVisible(element)) return element;
+                }
               } catch (e) {}
             }
             return null;
           }
 
-          const input = first(inputSelectors);
-          if (input) {
-            input.focus();
-            if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
-              const proto = input.tagName === 'TEXTAREA'
-                ? window.HTMLTextAreaElement.prototype
-                : window.HTMLInputElement.prototype;
-              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-              if (setter) setter.call(input, ''); else input.value = '';
-            } else if (input.isContentEditable) {
-              input.replaceChildren(document.createElement('p'));
-            }
-            input.dispatchEvent(new InputEvent('input', {
-              bubbles: true,
-              composed: true,
-              inputType: 'deleteContentBackward',
-              data: null
-            }));
-            input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-            input.blur();
+          const input = firstVisible(inputSelectors);
+          if (!input || !input.isConnected || !isVisible(input)) return metrics;
+
+          function safeRoot(node) {
+            if (!node || node === document || node === document.body || node === document.documentElement) return null;
+            if (node.tagName === 'BODY' || node.tagName === 'HTML') return null;
+            return node;
           }
+          let attachmentRoot = null;
+          if (typeof window.__starManagerAttachmentScope === 'function') {
+            try { attachmentRoot = safeRoot(window.__starManagerAttachmentScope()); } catch (e) { attachmentRoot = null; metrics.reset_error = 2; }
+          }
+          metrics.root_present = attachmentRoot ? 1 : 0;
+          if (!attachmentRoot) return metrics;
+          metrics.composer_ready = 1;
+
+          input.focus();
+          if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
+            const proto = input.tagName === 'TEXTAREA'
+              ? window.HTMLTextAreaElement.prototype
+              : window.HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (setter) setter.call(input, ''); else input.value = '';
+          } else if (input.isContentEditable) {
+            input.replaceChildren(document.createElement('p'));
+          }
+          input.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            composed: true,
+            inputType: 'deleteContentBackward',
+            data: null
+          }));
+          input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+          input.blur();
 
           const tiles = [];
           for (const selector of attachmentSelectors) {
             try {
-              for (const tile of document.querySelectorAll(selector)) {
+              for (const tile of attachmentRoot.querySelectorAll(selector)) {
                 if (!tiles.includes(tile)) tiles.push(tile);
               }
             } catch (e) {}
           }
-          for (const tile of tiles) {
-            const buttons = Array.from(tile.querySelectorAll('button, [role="button"]'));
-            const remove = buttons.find(function(button) {
-              const label = [
-                button.getAttribute('aria-label'),
-                button.getAttribute('title'),
-                button.textContent
-              ].filter(Boolean).join(' ').toLocaleLowerCase();
-              return /remove|delete|close|dismiss|삭제|제거|닫기/.test(label);
-            }) || buttons[buttons.length - 1];
-            if (remove) remove.click();
+          metrics.reset_tiles = Math.min(tiles.length, 100);
+          function isRemoveButton(button) {
+            const label = [
+              button.getAttribute('aria-label'),
+              button.getAttribute('title'),
+              button.textContent
+            ].filter(Boolean).join(' ').toLocaleLowerCase();
+            return /remove|delete|close|dismiss|삭제|제거|닫기/.test(label);
           }
-          return true;
+          // node 자신(버튼이면)과 하위에서 보이는 명시적 제거 버튼만 모은다.
+          function removeCandidatesIn(node) {
+            const candidates = [];
+            try { if (node.matches('button, [role="button"]')) candidates.push(node); } catch (e) {}
+            for (const button of node.querySelectorAll('button, [role="button"]')) {
+              if (!candidates.includes(button)) candidates.push(button);
+            }
+            return candidates.filter(function(button) { return isVisible(button) && isRemoveButton(button); });
+          }
+          // 타일 자체부터 시작해 검증된 attachmentRoot 까지(포함) 한 단계씩 올라가며
+          // 그 단계에 보이는 명시적 제거 버튼이 정확히 하나일 때만 누른다. 여러 개면
+          // 임의 선택 없이 그 타일을 포기하고, attachmentRoot 위로는 절대 올라가지 않는다.
+          // 겹치는 타일 가족이 같은 버튼을 두 번 누르지 않도록 중복 제거하고, 이전 클릭으로
+          // 문서에서 떨어진 타일·버튼은 건너뛴다.
+          const clicked = [];
+          for (const tile of tiles) {
+            if (!tile.isConnected || !attachmentRoot.contains(tile)) continue;
+            let chosen = null;
+            let level = tile;
+            while (level) {
+              const candidates = removeCandidatesIn(level).filter(function(button) {
+                return button.isConnected && !clicked.includes(button);
+              });
+              if (candidates.length === 1) { chosen = candidates[0]; break; }
+              if (candidates.length > 1) break;
+              if (level === attachmentRoot) break;
+              level = level.parentElement;
+            }
+            if (!chosen) continue;
+            clicked.push(chosen);
+            chosen.click();
+            metrics.reset_clicks = Math.min(metrics.reset_clicks + 1, 100);
+          }
+          return metrics;
+          } catch (e) {
+            metrics.composer_ready = 0;
+            if (metrics.reset_error === 0) metrics.reset_error = 1;
+            return metrics;
+          }
         })();
         """
     }
@@ -1799,6 +1934,9 @@ private enum ExternalAIBrowserScripts {
           // Gemini 고유의 send-button 클래스 예외를 Gemini 에만 적용하기 위한 별도 게이트다.
           const allowsAncestorSendSearch = \(provider == .gemini || provider == .claude ? "true" : "false");
           const isGeminiProvider = \(provider == .gemini ? "true" : "false");
+          // 첨부 카운트 루트 확장 시 대화 기록을 포함한 노드를 거부하기 위한 선택자.
+          // 답변 선택자에 더해, 기존 Claude 답변 선택자에 이미 쓰이는 사용자 메시지 클래스만 추가한다.
+          const historySelectors = assistantSelectors.concat(\(jsArray(provider == .claude ? [".font-user-message"] : [])));
 
           function queryFirst(selectors) {
             for (const sel of selectors) {
@@ -1907,14 +2045,78 @@ private enum ExternalAIBrowserScripts {
             return (element.innerText || element.textContent || '').trim();
           }
 
-          function attachmentCount() {
-            const scope = composerScope();
-            if (!scope) return 0;
+          function isRemoveButton(button) {
+            if (!button || !isVisible(button)) return false;
+            const label = [
+              button.getAttribute('aria-label'),
+              button.getAttribute('title'),
+              button.textContent
+            ].filter(Boolean).join(' ').toLowerCase();
+            return /remove|delete|close|dismiss|삭제|제거|닫기/.test(label);
+          }
+
+          function hasRemoval(element) {
+            if (!element || !isVisible(element)) return false;
+            try {
+              if (element.matches('button, [role="button"]') && isRemoveButton(element)) return true;
+            } catch (_) {}
+            for (const button of element.querySelectorAll('button, [role="button"]')) {
+              if (isRemoveButton(button)) return true;
+            }
+            return false;
+          }
+
+          // 주어진 노드 안에서 attachmentConfirmedSelectors 를 순서대로 조회해
+          // 보이는 매치가 처음 나온 selector 가족의 개수를 돌려준다(가족 간 합산 없음).
+          // formless Gemini·Claude 의 확장 카운트는 보이는 제거 버튼 기능이 확인된 미리보기만 센다.
+          function countAttachmentsIn(node, requiresRemoval) {
+            if (!node) return 0;
+            const editor = queryFirst(inputSelectors);
+            const isFormlessGeminiClaude = allowsAncestorSendSearch && (!editor || !editor.closest('form'));
+            const checkRemoval = requiresRemoval !== undefined ? requiresRemoval : isFormlessGeminiClaude;
             for (const selector of attachmentConfirmedSelectors) {
-              const matches = Array.from(scope.querySelectorAll(selector)).filter(isVisible);
+              const matches = Array.from(node.querySelectorAll(selector)).filter(function(el) {
+                return isVisible(el) && (!checkRemoval || hasRemoval(el));
+              });
               if (matches.length) return matches.length;
             }
             return 0;
+          }
+
+          function containsHistory(node) {
+            if (!node) return false;
+            return historySelectors.some(function(selector) {
+              try {
+                if (node.matches && node.matches(selector)) return true;
+                return node.querySelector(selector) !== null;
+              } catch (_) { return false; }
+            });
+          }
+
+          function attachmentScope() {
+            const scope = composerScope();
+            if (!scope) return null;
+            const editor = queryFirst(inputSelectors);
+            if (!allowsAncestorSendSearch || !editor || editor.closest('form')) return scope;
+            if (!editor.isConnected || !isVisible(editor)) return null;
+            const send = sendButton();
+            if (!send || !send.isConnected || !isVisible(send)) return null;
+            let node = scope;
+            while (node && !node.contains(send)) node = node.parentElement;
+            if (!node || node === document.body || node === document.documentElement) return null;
+            if (containsHistory(node)) return null;
+            const verifiedEmptyRoot = node;
+            while (node && node !== document.body && node !== document.documentElement) {
+              if (containsHistory(node)) break;
+              if (countAttachmentsIn(node, true)) return node;
+              node = node.parentElement;
+            }
+            return verifiedEmptyRoot;
+          }
+
+          function attachmentCount() {
+            const root = attachmentScope();
+            return root ? countAttachmentsIn(root) : 0;
           }
 
           function fileFromDataURL(dataURL, mime, filename) {
@@ -1979,6 +2181,7 @@ private enum ExternalAIBrowserScripts {
           };
 
           window.__starManagerAttachmentCount = attachmentCount;
+          window.__starManagerAttachmentScope = attachmentScope;
 
           // force가 false일 때는 사용자가 우리가 넣은 것과 다른 내용을 이미 입력해 두었다면
           // 덮어쓰지 않는다(자동 채우기가 사용자 편집을 방해하지 않도록).

@@ -55,7 +55,8 @@ final class AIBIDiagnosticsStore: ObservableObject {
         "generation_started", "generation_progress", "generation_completed", "generation_failed",
         "response_rejected", "result_applied", "manual_takeover", "run_cancelled", "run_failed",
         "run_completed", "bridge_snapshot", "event_limit_reached",
-        "request_started", "request_response", "request_failed"
+        "request_started", "request_response", "request_failed",
+        "composer_reset"
     ]
     private static let metricLimits: [String: ClosedRange<Int>] = [
         "expected_count": 0...100, "prepared_count": 0...100, "attached_count": 0...100,
@@ -69,7 +70,8 @@ final class AIBIDiagnosticsStore: ObservableObject {
         "attachment_verified": 0...1, "generation_active": 0...1,
         "request_kind": 1...2, "http_status": 0...599, "failure_kind": 1...3,
         "request_id": 1...1000, "request_has_messages": 0...1,
-        "image_count": 0...100
+        "image_count": 0...100,
+        "composer_ready": 0...1, "root_present": 0...1, "reset_tiles": 0...100, "reset_clicks": 0...100, "reset_error": 0...3
     ]
 
     private var runs: [UUID: Run] = [:]

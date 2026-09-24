@@ -22,11 +22,11 @@
           "source": "profiles/imanager/distribution/ios/AIBIMediaPipeline.swift"
         },
         "iManagerAI/Features/Composer/ExternalAIBrowserView.swift": {
-          "sha256": "84c6e846e42f267882cbb8c9544a918582178fc56e4484ac82a2a5c8f3a90615",
+          "sha256": "6e903dcc101a5eb25b0c80fdb9c0a8577c2df32ce45fb4ecfce25f9306948239",
           "source": "profiles/imanager/distribution/ios/ExternalAIBrowserView.swift"
         },
         "iManagerAI/Services/AIBIDiagnosticsStore.swift": {
-          "sha256": "8af7429ac2cfe058fa93681fbf15963fc61711cf94737a0045dc280fd612dbb6",
+          "sha256": "4578e740d5d6a62d2ac8d9012a3dffa71b7df39eee745cce20c57efa44ba225d",
           "source": "profiles/imanager/distribution/ios/AIBIDiagnosticsStore.swift"
         }
       }
