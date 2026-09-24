@@ -5,7 +5,7 @@ import Combine
 @MainActor
 final class AIBIDiagnosticsStore: ObservableObject {
     static let shared = AIBIDiagnosticsStore()
-    static let adapterVersion = "aibi-stargram-0.5.0"
+    static let adapterVersion = "aibi-stargram-0.5.1"
 
     @Published private(set) var currentRunID: UUID?
     @Published private(set) var exportURL: URL?

@@ -1795,6 +1795,10 @@ private enum ExternalAIBrowserScripts {
           const fileInputSelectors = \(jsArray(config.fileInput));
           const attachTriggerSelectors = \(jsArray(config.attachTrigger));
           const attachmentConfirmedSelectors = \(jsArray(config.attachmentConfirmed));
+          // 조상 폴백 허용 여부는 Gemini·Claude 로 한정한다. isGeminiProvider 는
+          // Gemini 고유의 send-button 클래스 예외를 Gemini 에만 적용하기 위한 별도 게이트다.
+          const allowsAncestorSendSearch = \(provider == .gemini || provider == .claude ? "true" : "false");
+          const isGeminiProvider = \(provider == .gemini ? "true" : "false");
 
           function queryFirst(selectors) {
             for (const sel of selectors) {
@@ -1857,6 +1861,38 @@ private enum ExternalAIBrowserScripts {
                 if (/stop|중지|정지|voice|음성/.test(meaning)) continue;
                 if (isVisible(button)) return button;
               }
+            }
+            return ancestorSendButton(scope);
+          }
+
+          // Gemini·Claude 전용 폴백. 두 제공사는 form 없이 send 버튼이 기존 스코프보다 위에 있다.
+          // 스코프 검색 실패 시 스코프 부모부터 body/documentElement 앞까지 한 단계씩 재검색한다.
+          // 명시적 send 의미(또는 Gemini 의 send-button 클래스)를 가진 보이는 후보만 인정하며,
+          // 가장 가까운 조상에서 정확히 1개일 때만 반환한다. 실측 depth 근거는 루트 검증 문서 참고.
+          function ancestorSendButton(scope) {
+            if (!allowsAncestorSendSearch || !scope) return null;
+            const input = queryFirst(inputSelectors);
+            if (!input || input.closest('form')) return null;
+            let node = scope.parentElement;
+            while (node && node !== document.body && node !== document.documentElement) {
+              const candidates = [];
+              for (const selector of sendSelectors) {
+                try {
+                  for (const button of node.querySelectorAll(selector)) {
+                    if (candidates.includes(button)) continue;
+                    if (!isVisible(button)) continue;
+                    const meaning = ((button.getAttribute('aria-label') || '') + ' ' + (button.getAttribute('data-testid') || '')).toLowerCase();
+                    if (/stop|중지|정지|voice|음성/.test(meaning)) continue;
+                    const positive = /send|submit|보내기|전송|제출/i.test(meaning)
+                      || (isGeminiProvider && button.classList && button.classList.contains('send-button'));
+                    if (!positive) continue;
+                    candidates.push(button);
+                  }
+                } catch (e) {}
+              }
+              if (candidates.length === 1) return candidates[0];
+              if (candidates.length > 1) return null;
+              node = node.parentElement;
             }
             return null;
           }
