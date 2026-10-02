@@ -2100,7 +2100,16 @@ private enum ExternalAIBrowserScripts {
             if (!allowsAncestorSendSearch || !editor || editor.closest('form')) return scope;
             if (!editor.isConnected || !isVisible(editor)) return null;
             const send = sendButton();
-            if (!send || !send.isConnected || !isVisible(send)) return null;
+            // Gemini/Claude는 글과 첨부가 모두 비어 있을 때 보내기 버튼을 DOM에
+            // 아예 렌더링하지 않는다. 그 순간에도 reset 단계는 작성창을 준비해야
+            // 하므로, 보내기 버튼을 못 찾았다고 영구히 실패시키지 않고 좁은
+            // composer scope로 대체한다. 버튼이 있으면 기존 조상 확장 로직을 그대로 쓴다.
+            // composerScope()의 parent3 체인이 얕은 DOM에서 이론상 document/body/html
+            // 자체에 닿을 수 있으므로, history 검사와 별도로 루트 경계를 명시적으로 거부한다.
+            if (!send || !send.isConnected || !isVisible(send)) {
+              if (!scope || scope === document || scope === document.body || scope === document.documentElement) return null;
+              return containsHistory(scope) ? null : scope;
+            }
             let node = scope;
             while (node && !node.contains(send)) node = node.parentElement;
             if (!node || node === document.body || node === document.documentElement) return null;
