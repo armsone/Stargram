@@ -193,6 +193,16 @@ struct ExternalAIHiddenAutomatorView: View {
                 }
             }
 
+            // 전송을 이미 시도한 뒤 새 문서 커밋으로 Task가 다시 시작됐다면 다시 채우거나 보내지
+            // 않고 전송 확인만 이어 간다(`submitPrompt`는 시도 기록이 있으면 클릭하지 않는다).
+            if bridge.isPageReady, bridge.hasAttemptedSubmission {
+                if await submitPromptWhenReady() { return }
+                guard !Task.isCancelled else { return }
+                hasTriggeredFallback = true
+                onError("전송 뒤 응답 시작을 확인하지 못했어요. 설정의 AI 진단 로그를 공유해 주세요.")
+                return
+            }
+
             if bridge.isPageReady, attachments.isEmpty || attachConfirmed {
                 checkCount += 1
                 // 숨은 자동화 브라우저는 사용자 편집 화면이 아니므로 이전 초안이 있더라도
@@ -202,11 +212,18 @@ struct ExternalAIHiddenAutomatorView: View {
                     if await submitPromptWhenReady() {
                         return
                     }
+                    // 취소된 Task는 오류를 알리지 않는다. 새 문서의 Task가 전송 확인을 이어 간다.
+                    guard !Task.isCancelled else { return }
                     if bridge.hasAttemptedSubmission {
                         hasTriggeredFallback = true
                         onError("전송 뒤 응답 시작을 확인하지 못했어요. 설정의 AI 진단 로그를 공유해 주세요.")
                         return
                     }
+                } else if bridge.isAutomaticFillBudgetExhausted {
+                    // 자동 채우기 상한에 이르렀다. 입력창은 있었으므로 로그인 필요로 보고하지 않는다.
+                    hasTriggeredFallback = true
+                    onFallback(.timeout)
+                    return
                 } else if checkCount >= 12 { // 약 8초 동안 입력창 미발견 시 로그인/개입 필요 판단
                     if let reason = bridge.interactionReason {
                         hasTriggeredFallback = true
@@ -236,6 +253,8 @@ struct ExternalAIHiddenAutomatorView: View {
                 onSubmitted?(Date())
                 return true
             }
+            // 전송 시도 전에 페이지가 넣은 문구를 교체했다면 기다려도 일치할 수 없다. 호출 루프가 다시 채운다.
+            if await bridge.isPromptReplacedBeforeSend() { return false }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         if !Task.isCancelled, !hasSubmitted { bridge.log("send_timeout") }
@@ -347,7 +366,7 @@ struct ExternalAIBrowserSheet: View {
                             refillTask?.cancel()
                             refillTask = Task {
                                 guard await attachPhotoIfNeeded() else { return }
-                                if await fillPrompt(force: true) {
+                                if await fillPrompt(force: true, automatic: false) {
                                     await submitPromptWhenReady()
                                 }
                             }
@@ -544,7 +563,7 @@ struct ExternalAIBrowserSheet: View {
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// 각 메인 프레임 내비게이션이 끝날 때마다(로그인 리디렉션 포함) 호출되어,
+    /// 새 메인 프레임 문서가 커밋될 때마다(로그인 리디렉션 포함) 호출되어,
     /// 입력창이 나타날 때까지 정해진 시간(45초) 동안 재시도한다.
     /// `.task(id:)`가 새 내비게이션 세대마다 이전 시도를 자동으로 취소해 준다.
     /// 첨부가 필요 없으면 즉시 통과하고, 필요하면 한 번 자동 첨부를 시도한 뒤 첨부 확인
@@ -617,6 +636,16 @@ struct ExternalAIBrowserSheet: View {
         while !Task.isCancelled, Date() < deadline, !hasSubmittedPrompt {
             // 작성창 정리에 실패하면 새 요청을 첨부하거나 보내지 않고 자동 실행을 끝낸다.
             if composerPreparation == .failed { return }
+            // 전송을 이미 시도한 뒤 새 문서 커밋으로 Task가 다시 시작됐다면 다시 채우거나 보내지
+            // 않고 전송 확인만 이어 간다(`submitPrompt`는 시도 기록이 있으면 클릭하지 않는다).
+            if bridge.isPageReady, bridge.hasAttemptedSubmission {
+                if await submitPromptWhenReady() { return }
+                guard !Task.isCancelled else { return }
+                let message = "전송 뒤 응답 시작을 확인하지 못했어요. 설정의 AI 진단 로그를 공유해 주세요."
+                detectedErrorMessage = message
+                onError?(message)
+                return
+            }
             if bridge.isPageReady, await attachPhotoIfNeeded() {
                 // 새 요청의 스냅샷은 기존 대화창 초안이나 iOS의 클립보드 제안보다
                 // 항상 우선한다. 사용자가 이미 적어 둔 웹 입력은 이 자동 실행 전에
@@ -625,6 +654,8 @@ struct ExternalAIBrowserSheet: View {
                     if await submitPromptWhenReady() {
                         return
                     }
+                    // 취소된 Task는 오류를 알리지 않는다. 새 문서의 Task가 전송 확인을 이어 간다.
+                    guard !Task.isCancelled else { return }
                     if bridge.hasAttemptedSubmission {
                         let message = "전송 뒤 응답 시작을 확인하지 못했어요. 설정의 AI 진단 로그를 공유해 주세요."
                         detectedErrorMessage = message
@@ -659,6 +690,8 @@ struct ExternalAIBrowserSheet: View {
                 markSubmitted()
                 return true
             }
+            // 전송 시도 전에 페이지가 넣은 문구를 교체했다면 기다려도 일치할 수 없다. 호출 루프가 다시 채운다.
+            if await bridge.isPromptReplacedBeforeSend() { return false }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         if !Task.isCancelled, !hasSubmittedPrompt {
@@ -669,8 +702,8 @@ struct ExternalAIBrowserSheet: View {
     }
 
     @discardableResult
-    private func fillPrompt(force: Bool) async -> Bool {
-        let success = await bridge.fillPrompt(prompt, force: force)
+    private func fillPrompt(force: Bool, automatic: Bool = true) async -> Bool {
+        let success = await bridge.fillPrompt(prompt, force: force, automatic: automatic)
         if success {
             hasFilledPrompt = true
             fillFailed = false
@@ -950,6 +983,7 @@ struct ExternalAILoginSheet: View {
     }
 
     private func pollLoginStatus() async {
+        bridge.recordsControlDiagnostics = true
         while !Task.isCancelled, !didConfirmLogin {
             if bridge.isPageReady,
                !bridge.loginOriginDetected,
@@ -1003,9 +1037,20 @@ final class ExternalAILoginProbeBridge: ObservableObject {
     @Published fileprivate(set) var rendererTerminated = false
 
     fileprivate weak var webView: WKWebView?
-    /// 페이지(내비게이션)당 한 번만 사이드바 열기를 시도하도록 막는 플래그. 매 폴링마다
-    /// 다시 누르는 토글 반복을 막기 위해 새 내비게이션이 시작될 때만 초기화한다.
-    private var sidebarOpenAttempted = false
+    /// 페이지(내비게이션)당 사이드바 열기 클릭 횟수. readyState 준비는 하이드레이션 전일 수 있어
+    /// 첫 클릭이 무시될 수 있으므로(Android 실측: 세 번째 폴링에서 마커 등장) 한 번으로 끝내지 않고
+    /// 모호한 상태에서만 제한된 횟수까지 다시 누른다. 새 내비게이션이 시작될 때만 초기화한다.
+    private var sidebarOpenAttempts = 0
+    private static let maxSidebarOpenAttempts = 6
+    /// 펼침 상태(`aria-expanded='false'`)를 밝히지 않는 사이드바 토글은 다시 누르면 닫힐 수 있으므로
+    /// 페이지당 한 번만 누른다. 펼침 상태가 명시된 닫힌 컨트롤만 위 횟수 안에서 다시 누를 수 있다.
+    private var statelessSidebarToggleUsed = false
+    /// 증거가 전혀 없는 확인 횟수. 상태 없는 토글은 하이드레이션 전 클릭을 피하려고 두 번째부터 누른다.
+    private var ambiguousAuthChecks = 0
+    /// 사용자가 연 로그인 화면에서만 켠다. 사이드바 컨트롤 범주별 숫자만 페이지당 한 번 기록한다.
+    fileprivate var recordsControlDiagnostics = false
+    private var controlDiagnosticsRecorded = false
+    private var navigationStartedAt = ProcessInfo.processInfo.systemUptime
     private var documentReadyTask: Task<Void, Never>?
     /// 내비게이션/리셋/렌더러 종료/화면 해제마다 증가한다. `didCommitNavigation`이 스폰한
     /// 폴링 Task는 매 await 재개 시점마다 이 값과 자신이 캡처한 값을 비교해, 그 사이에 새
@@ -1014,7 +1059,11 @@ final class ExternalAILoginProbeBridge: ObservableObject {
 
     fileprivate func didStartNavigation() {
         isPageReady = false
-        sidebarOpenAttempted = false
+        sidebarOpenAttempts = 0
+        statelessSidebarToggleUsed = false
+        ambiguousAuthChecks = 0
+        controlDiagnosticsRecorded = false
+        navigationStartedAt = ProcessInfo.processInfo.systemUptime
         documentReadyTask?.cancel()
         documentReadyTask = nil
         docEpoch += 1
@@ -1110,38 +1159,70 @@ final class ExternalAILoginProbeBridge: ObservableObject {
         let script = ExternalAIBrowserScripts.authStatusProbeScript(for: provider)
         let result = await Self.evaluateBounded(script, in: webView, timeout: 5)
 
-        // 로그인/챌린지/인증 마커가 전부 없는 모호한 상태일 때만, ChatGPT의 접힌 모바일
-        // 사이드바를 한 번 열어서 계정 메뉴·대화 목록 같은 증거를 다시 찾아본다.
+        // 로그인/챌린지/인증 마커가 전부 없는 모호한 상태일 때만, ChatGPT·Claude의 접힌 모바일
+        // 사이드바를 (페이지당 제한된 횟수 안에서) 열어 계정 메뉴·대화 목록 같은 증거를 다시 찾아본다.
         // 로그인 사용자가 손으로 사이드바를 열어야만 인식되는 문제를 자동화 쪽에서 메우려는
-        // 조치이며, 이미 명확한 증거가 있으면 건너뛴다.
-        guard provider == .openAI,
+        // 조치이며, 이미 명확한 증거가 있으면 건너뛴다. 인증은 여전히 계정 마커로만 판정한다.
+        guard ExternalAIBrowserScripts.openSidebarScript(for: provider, allowStatelessToggle: false) != nil,
               !result.authenticated, !result.hasLogin, !result.hasChallenge,
-              !sidebarOpenAttempted
+              sidebarOpenAttempts < Self.maxSidebarOpenAttempts
         else {
             return result
         }
-        let openScript = ExternalAIBrowserScripts.openChatGPTSidebarScript()
-        let didOpen = await Self.evaluateBoundedSidebarOpen(openScript, in: webView, timeout: 3)
-        guard didOpen else { return result }
-        sidebarOpenAttempted = true
+        ambiguousAuthChecks += 1
+        let allowStatelessToggle = !statelessSidebarToggleUsed && ambiguousAuthChecks >= 2
+        guard let openScript = ExternalAIBrowserScripts.openSidebarScript(for: provider, allowStatelessToggle: allowStatelessToggle)
+        else { return result }
+        // 클릭 전 컨트롤 상태를 숫자로만 잰다(로그인 화면, Claude, 페이지당 한 번 기록).
+        let controlCounts = recordsControlDiagnostics && !controlDiagnosticsRecorded && provider == .claude
+            ? await Self.evaluateBoundedCounts(ExternalAIBrowserScripts.claudeSidebarControlCountsScript(), in: webView, timeout: 3)
+            : nil
+        let clickKind = await Self.evaluateBoundedSidebarOpen(openScript, in: webView, timeout: 3)
+        let didOpen = clickKind > 0
+        guard didOpen else {
+            if let controlCounts, ambiguousAuthChecks >= 5 {
+                recordControlDiagnostics(controlCounts, clickKind: 0, authenticated: false)
+            }
+            return result
+        }
+        sidebarOpenAttempts += 1
+        if clickKind == 2 { statelessSidebarToggleUsed = true }
 
         try? await Task.sleep(nanoseconds: 300_000_000)
-        return await Self.evaluateBounded(script, in: webView, timeout: 5)
+        let afterOpen = await Self.evaluateBounded(script, in: webView, timeout: 5)
+        if let controlCounts {
+            recordControlDiagnostics(controlCounts, clickKind: clickKind, authenticated: afterOpen.authenticated)
+        }
+        return afterOpen
+    }
+
+    /// 사이드바 컨트롤 범주별 개수·클릭 종류·클릭 뒤 계정 마커(0/1)만 남긴다. 문구·DOM·URL은 없다.
+    private func recordControlDiagnostics(_ counts: [String: Int], clickKind: Int, authenticated: Bool) {
+        controlDiagnosticsRecorded = true
+        var metrics = counts
+        metrics["sidebar_click_kind"] = clickKind
+        metrics["auth_marker_present"] = authenticated ? 1 : 0
+        metrics["attempt"] = sidebarOpenAttempts
+        let elapsed = Int(max(0, ProcessInfo.processInfo.systemUptime - navigationStartedAt) * 1000)
+        AIBIDiagnosticsStore.shared.recordProbeSnapshot(
+            provider: "claude", event: "auth_probe_controls", elapsedMilliseconds: elapsed, metrics: metrics
+        )
     }
 
     /// `evaluateBounded`와 같은 방식으로 단일 호출을 시간 제한에 묶지만, 사이드바 열기
-    /// 스크립트는 클릭 성공 여부만 돌려주므로 별도의 결과 타입을 쓴다.
+    /// 스크립트는 클릭 종류만 돌려준다. 0: 누르지 않음, 1: 닫힘 상태가 명시된 컨트롤,
+    /// 2: 상태 없는 토글(페이지당 한 번). `kind`가 없는 ChatGPT 결과의 클릭은 1로 본다.
     @MainActor
     private static func evaluateBoundedSidebarOpen(
         _ script: String,
         in webView: WKWebView,
         timeout: TimeInterval
-    ) async -> Bool {
+    ) async -> Int {
         final class FinishGuard {
             var finished = false
         }
         let guardBox = FinishGuard()
-        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Int, Never>) in
             webView.evaluateJavaScript(script) { result, _ in
                 MainActor.assumeIsolated {
                     guard !guardBox.finished else { return }
@@ -1152,21 +1233,52 @@ final class ExternalAILoginProbeBridge: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
                 guard !guardBox.finished else { return }
                 guardBox.finished = true
-                continuation.resume(returning: false)
+                continuation.resume(returning: 0)
             }
         }
     }
 
-    private static func parseSidebarOpenResult(_ raw: Any?) -> Bool {
-        if let dict = raw as? [String: Any] {
-            return (dict["clicked"] as? Bool) ?? false
+    private static func parseSidebarOpenResult(_ raw: Any?) -> Int {
+        guard let json = jsonObject(raw), (json["clicked"] as? Bool) == true else { return 0 }
+        return (json["kind"] as? NSNumber)?.intValue == 2 ? 2 : 1
+    }
+
+    /// 숫자 필드만 남긴다(저장소가 허용 키·범위로 다시 거른다).
+    @MainActor
+    private static func evaluateBoundedCounts(
+        _ script: String,
+        in webView: WKWebView,
+        timeout: TimeInterval
+    ) async -> [String: Int] {
+        final class FinishGuard {
+            var finished = false
         }
+        let guardBox = FinishGuard()
+        return await withCheckedContinuation { (continuation: CheckedContinuation<[String: Int], Never>) in
+            webView.evaluateJavaScript(script) { result, _ in
+                MainActor.assumeIsolated {
+                    guard !guardBox.finished else { return }
+                    guardBox.finished = true
+                    let counts = (jsonObject(result) ?? [:]).compactMapValues { ($0 as? NSNumber)?.intValue }
+                    continuation.resume(returning: counts)
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                guard !guardBox.finished else { return }
+                guardBox.finished = true
+                continuation.resume(returning: [:])
+            }
+        }
+    }
+
+    private static func jsonObject(_ raw: Any?) -> [String: Any]? {
+        if let dict = raw as? [String: Any] { return dict }
         if let string = raw as? String,
            let data = string.data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            return (json["clicked"] as? Bool) ?? false
+            return json
         }
-        return false
+        return nil
     }
 
     /// Bounds a single `evaluateJavaScript` call to `timeout` seconds so a stalled renderer that
@@ -1313,8 +1425,9 @@ final class ExternalAIBrowserBridge: ObservableObject {
     @Published fileprivate(set) var isGenerating = false
     @Published fileprivate(set) var isAnswerStable = false
     @Published fileprivate(set) var latestAnswer = ""
-    /// 메인 프레임 내비게이션이 끝날 때마다 증가한다. SwiftUI가 이 값을 `.task(id:)`로 관찰해
-    /// 로그인 리디렉션 이후에도 자동 채우기 시도를 다시 시작할 수 있게 한다.
+    /// 새 메인 프레임 문서가 커밋되거나 렌더러가 종료될 때만 증가한다. SwiftUI가 이 값을
+    /// `.task(id:)`로 관찰해 로그인 리디렉션 이후에도 자동 채우기 시도를 다시 시작할 수 있게 한다.
+    /// 같은 문서의 `didFinish`/실패 콜백은 이 값을 바꾸지 않는다.
     @Published fileprivate(set) var navigationGeneration = 0
     @Published fileprivate(set) var interactionReason: ExternalAIFallbackReason?
     @Published fileprivate(set) var detectedError: String?
@@ -1326,6 +1439,12 @@ final class ExternalAIBrowserBridge: ObservableObject {
     private var expectedAttachmentCount = 0
     fileprivate var diagnosticRunID: UUID?
     private var lastDiagnosticSnapshot: [String: Int] = [:]
+    /// 같은 입력 실패를 700ms마다 반복 기록하지 않도록 직전 실패 단계만 기억한다.
+    /// `prompt_failed`는 관찰 스크립트가 거부한 경우, `bridge_failed`는 관찰 스크립트가 없거나 평가가 실패한 경우다.
+    private var lastFillFailure: String?
+    /// 이 브라우저에서 성공한 채우기 횟수(`prompt_inserted`의 attempt). 전송 전 교체 복구의 상한에 쓴다.
+    private var promptFillCount = 0
+    static let maxPromptFillsBeforeSend = 3
     private var documentReadyTask: Task<Void, Never>?
     /// 내비게이션/리셋/렌더러 종료/화면 해제마다 증가한다. `didCommitNavigation`이 스폰한
     /// 폴링 Task는 매 await 재개 시점마다 이 값과 자신이 캡처한 값을 비교해, 그 사이에 새
@@ -1378,23 +1497,72 @@ final class ExternalAIBrowserBridge: ObservableObject {
     /// 입력창에 프롬프트를 채운다. 자동으로 보내지는 않는다.
     /// `force`가 false면 사용자가 이미 다른 내용을 입력해 둔 경우 덮어쓰지 않는다.
     /// JavaScript가 실제로 입력창을 채웠는지 여부를 그대로 돌려준다.
+    /// 자동 채우기(`automatic`)는 이 브라우저에서 성공한 채우기가 `maxPromptFillsBeforeSend`번에
+    /// 이르면 더 채우지 않는다(바깥 루프가 15초 대기 뒤 다시 불러도 상한을 넘지 않는다).
+    /// 사용자가 직접 누른 '다시 넣기'만 이 상한과 무관하다.
     @discardableResult
-    func fillPrompt(_ prompt: String, force: Bool) async -> Bool {
-        guard !Task.isCancelled, let webView, !hasAttemptedSubmission else { return false }
+    func fillPrompt(_ prompt: String, force: Bool, automatic: Bool = true) async -> Bool {
+        guard !Task.isCancelled, let webView, !hasAttemptedSubmission,
+              !automatic || !isAutomaticFillBudgetExhausted else { return false }
         let literal = ExternalAIBrowserScripts.jsStringLiteral(prompt)
         let script = "window.__starManagerFillPrompt && window.__starManagerFillPrompt(\(literal), \(force));"
         do {
             let result = try await webView.evaluateJavaScript(script)
             let success = Self.boolean(from: result)
             if success {
-                log("prompt_inserted", ["prompt_length": prompt.count])
+                lastFillFailure = nil
+                promptFillCount += 1
+                log("prompt_inserted", ["prompt_length": prompt.count, "attempt": promptFillCount])
                 isAnswerStable = false
                 latestAnswer = ""
+            } else if result is NSNumber {
+                logFillFailure("prompt_failed")
+            } else {
+                // `window.__starManagerFillPrompt`가 없으면 false가 아닌 undefined가 돌아온다.
+                logFillFailure("bridge_failed", failureKind: 4)
             }
             return success
         } catch {
+            logFillFailure("bridge_failed", failureKind: Self.evaluationFailureKind(error))
             return false
         }
+    }
+
+    private func logFillFailure(_ event: String, failureKind: Int? = nil) {
+        guard lastFillFailure != event else { return }
+        lastFillFailure = event
+        log(event, failureKind.map { ["failure_kind": $0] } ?? [:])
+    }
+
+    /// `bridge_failed`의 원인 범주만 숫자로 남긴다. 예외 메시지·스택·URL은 기록하지 않는다.
+    /// 2: 페이지 JavaScript 예외가 TypeError, 3: 그 밖의 평가 오류, 4: 헬퍼 없음(지원하지 않는 결과 형식).
+    private static func evaluationFailureKind(_ error: Error) -> Int {
+        let nsError = error as NSError
+        guard nsError.domain == WKError.errorDomain else { return 3 }
+        if nsError.code == WKError.Code.javaScriptResultTypeIsUnsupported.rawValue { return 4 }
+        if nsError.code == WKError.Code.javaScriptExceptionOccurred.rawValue,
+           let message = nsError.userInfo["WKJavaScriptExceptionMessage"] as? String,
+           message.hasPrefix("TypeError") {
+            return 2
+        }
+        return 3
+    }
+
+    var isAutomaticFillBudgetExhausted: Bool { promptFillCount >= Self.maxPromptFillsBeforeSend }
+
+    /// 전송을 한 번도 시도하지 않았는데 로드가 끝난 실제 입력창의 내용이 넣은 문구와 달라졌는지
+    /// (프레임워크가 하이드레이션 중 교체·정규화) 확인한다. 참이면 호출자는 15초 전송 대기를 끝내고
+    /// 같은 문구를 다시 채운 뒤 전송 게이트(정규화 전체 일치·첨부 수)를 그대로 통과해야만 보낸다.
+    /// 재입력은 첫 채우기 포함 `maxPromptFillsBeforeSend`번까지로 제한한다.
+    func isPromptReplacedBeforeSend() async -> Bool {
+        guard !Task.isCancelled, let webView, !hasAttemptedSubmission,
+              (1..<Self.maxPromptFillsBeforeSend).contains(promptFillCount) else { return false }
+        let state = try? await webView.evaluateJavaScript(
+            "window.__starManagerPromptState ? window.__starManagerPromptState() : 0;"
+        )
+        guard !Task.isCancelled, !hasAttemptedSubmission, (state as? NSNumber)?.intValue == 2 else { return false }
+        log("send_blocked", ["prompt_present": 0, "attempt": promptFillCount])
+        return true
     }
 
     /// 선택한 1~8장의 정규화 사본을 한 배치로 연결하고, 미리보기 수가 정확히
@@ -1566,7 +1734,11 @@ final class ExternalAIBrowserBridge: ObservableObject {
                 )
                 guard Self.boolean(from: attempted) else { return false }
                 hasAttemptedSubmission = true
-                log("send_attempted", ["attempt": 1])
+                var attemptMetrics = ["attempt": 1]
+                if let samples = attempted as? NSNumber, CFGetTypeID(samples) != CFBooleanGetTypeID() {
+                    attemptMetrics["stable_samples"] = samples.intValue
+                }
+                log("send_attempted", attemptMetrics)
             }
             try? await Task.sleep(nanoseconds: 700_000_000)
             let verified = try await webView.evaluateJavaScript(
@@ -1585,7 +1757,7 @@ final class ExternalAIBrowserBridge: ObservableObject {
             }
             return didSubmit
         } catch {
-            log("bridge_failed")
+            log("bridge_failed", ["failure_kind": Self.evaluationFailureKind(error)])
             return false
         }
     }
@@ -1604,16 +1776,27 @@ final class ExternalAIBrowserBridge: ObservableObject {
         isAnswerStable = false
         latestAnswer = ""
         detectedError = nil
+        lastFillFailure = nil
         documentReadyTask?.cancel()
         documentReadyTask = nil
         docEpoch += 1
     }
 
-    fileprivate func markNavigationFinished() {
+    /// 실패/취소로 끝난 내비게이션은 `loaded: false`로 불러 `browser_loaded`로 기록하지 않는다.
+    /// 같은 문서의 완료/실패 콜백은 준비 상태만 갱신하고 `navigationGeneration`을 올리지 않는다.
+    /// `bridge_ready`로 이미 채우고 전송 중인 자동 입력 Task를 같은 문서의 늦은 `didFinish`가
+    /// 취소하고 처음부터 다시 시작하게 만들던 결함 때문이다. 세대는 문서가 실제로 바뀔 때
+    /// (`didCommitNavigation`, `markRendererTerminated`)만 올린다.
+    fileprivate func markNavigationFinished(loaded: Bool = true) {
         documentReadyTask?.cancel()
         documentReadyTask = nil
-        log("browser_loaded")
+        if loaded { log("browser_loaded") }
         isPageReady = true
+    }
+
+    /// 렌더러가 죽으면 이전 문서와 주입 상태가 사라지므로 새 문서로 취급해 Task를 다시 시작한다.
+    fileprivate func markRendererTerminated() {
+        markNavigationFinished()
         navigationGeneration += 1
     }
 
@@ -1626,6 +1809,8 @@ final class ExternalAIBrowserBridge: ObservableObject {
     /// a per-call timeout and a maximum poll duration, and never inspects auth/composer markers.
     fileprivate func didCommitNavigation() {
         documentReadyTask?.cancel()
+        // 새 메인 프레임 문서가 커밋된 순간만 이전 문서의 자동 입력 Task를 취소하고 다시 시작한다.
+        navigationGeneration += 1
         guard let webView else { return }
         let epoch = docEpoch
         documentReadyTask = Task { [weak self, weak webView] in
@@ -1641,6 +1826,7 @@ final class ExternalAIBrowserBridge: ObservableObject {
                 let interactive = await Self.isDocumentInteractive(in: currentWebView, timeout: 2)
                 guard !Task.isCancelled, let (bridge, _) = stillValid() else { return }
                 if interactive {
+                    bridge.log("bridge_ready")
                     bridge.isPageReady = true
                     return
                 }
@@ -1803,7 +1989,18 @@ private struct ExternalAIWebView: UIViewRepresentable {
             completionHandler(fileURLs)
         }
 
+        /// 가장 최근에 시작된 메인 프레임 내비게이션. 새 내비게이션에 밀려 취소된 이전 내비게이션의
+        /// 늦은 실패 콜백이 아직 커밋되지 않은 새 문서를 준비 완료로 표시하지 못하게 한다.
+        private var latestNavigation: WKNavigation?
+
+        private func isSuperseded(_ navigation: WKNavigation?) -> Bool {
+            guard let navigation, let latestNavigation else { return false }
+            return navigation !== latestNavigation
+        }
+
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            latestNavigation = navigation
+            bridge.log("navigation_started")
             bridge.resetForNewNavigation()
             if let url = webView.url?.absoluteString {
                 bridge.checkURLForInteraction(url)
@@ -1811,10 +2008,13 @@ private struct ExternalAIWebView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            guard !isSuperseded(navigation) else { return }
+            bridge.log("navigation_committed")
             bridge.didCommitNavigation()
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard !isSuperseded(navigation) else { return }
             if let url = webView.url?.absoluteString {
                 bridge.checkURLForInteraction(url)
             }
@@ -1833,25 +2033,29 @@ private struct ExternalAIWebView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            let nsError = error as NSError
-            if nsError.domain != NSURLErrorDomain || nsError.code != NSURLErrorCancelled {
-                bridge.detectedError = error.localizedDescription
-            }
-            bridge.markNavigationFinished()
+            handleNavigationFailure(navigation, error: error)
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            handleNavigationFailure(navigation, error: error)
+        }
+
+        /// 실패 종류만 기록한다(1 = 취소, 3 = 그 밖의 오류). URL이나 오류 문구는 진단에 남기지 않는다.
+        private func handleNavigationFailure(_ navigation: WKNavigation?, error: Error) {
             let nsError = error as NSError
-            if nsError.domain != NSURLErrorDomain || nsError.code != NSURLErrorCancelled {
+            let cancelled = nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
+            bridge.log("browser_load_failed", ["failure_kind": cancelled ? 1 : 3])
+            guard !isSuperseded(navigation) else { return }
+            if !cancelled {
                 bridge.detectedError = error.localizedDescription
             }
-            bridge.markNavigationFinished()
+            bridge.markNavigationFinished(loaded: false)
         }
 
         /// WebKit silently kills the WebContent process without calling didFail/didFailProvisionalNavigation, so this must end the task the same way any other detected error does.
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             bridge.detectedError = "브라우저 화면이 중단됐어요. 다시 시도해 주세요."
-            bridge.markNavigationFinished()
+            bridge.markRendererTerminated()
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -2245,6 +2449,9 @@ private enum ExternalAIBrowserScripts {
           // ChatGPT 는 form 없는 DIV role=textbox 작성창을 쓰고, 고정 3단계 조상은 첨부 미리보기를
           // 담기에 너무 좁다. ChatGPT 에만 의미 기반 조상 해석을 켠다(공식 페이지 실측 근거 문서 참고).
           const usesSemanticComposerRoot = \(provider == .openAI ? "true" : "false");
+          // 이 문서에서 제공사 생성 표시(기존 generating 선택자)를 한 번이라도 봤는지. 한 방향으로만 바뀐다.
+          // 자동 클릭 표시가 없어도 사용자가 직접 보냈을 수 있으므로, 생성 표시가 사라진 뒤에도 자동 채우기·전송을 하지 않는다.
+          let generationObserved = false;
           const semanticAttachButtonSelectors = attachTriggerSelectors.concat(["button[aria-label='파일 등 추가']"]);
           const semanticRootMaxDepth = 8;
           // 첨부 카운트 루트 확장 시 대화 기록을 포함한 노드를 거부하기 위한 선택자.
@@ -2319,9 +2526,15 @@ private enum ExternalAIBrowserScripts {
           }
 
           function isGeneratingNow() {
-            return generatingSelectors.some(function(selector) {
+            const active = generatingSelectors.some(function(selector) {
               try { return Array.from(document.querySelectorAll(selector)).some(isVisible); } catch (_) { return false; }
             });
+            if (active) generationObserved = true;
+            return active;
+          }
+
+          function generationSeen() {
+            return isGeneratingNow() || generationObserved;
           }
 
           function composerScope() {
@@ -2616,10 +2829,28 @@ private enum ExternalAIBrowserScripts {
           window.__starManagerAttachmentCount = attachmentCount;
           window.__starManagerAttachmentScope = attachmentScope;
 
+          // 전송 게이트(__starManagerSendPrompt)와 같은 공백 정규화. 문구 자체는 밖으로 보내지 않는다.
+          function normalizedPromptText(value) {
+            return String(value || '').replace(/\\s+/g, ' ').trim();
+          }
+
+          function quillParagraphs(text) {
+            return String(text).split(/\\r\\n|\\r|\\n/).map(function(line) {
+              const paragraph = document.createElement('p');
+              if (line) {
+                paragraph.textContent = line;
+              } else {
+                paragraph.appendChild(document.createElement('br'));
+              }
+              return paragraph;
+            });
+          }
+
           // force가 false일 때는 사용자가 우리가 넣은 것과 다른 내용을 이미 입력해 두었다면
           // 덮어쓰지 않는다(자동 채우기가 사용자 편집을 방해하지 않도록).
           window.__starManagerFillPrompt = function(text, force) {
-            if (window.__starManagerSubmitDispatched) return false;
+            // 상태 확인과 채우기 사이에 생성이 시작될 수 있으므로 쓰기 직전에 다시 본다.
+            if (window.__starManagerSubmitDispatched || generationSeen()) return false;
             const el = queryEditor();
             if (!el) return false;
             const isTextField = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
@@ -2633,12 +2864,36 @@ private enum ExternalAIBrowserScripts {
             if (!force && current.length > 0 && current !== window.__starManagerLastFilled) {
               return false;
             }
+            sendReadiness = null;
             el.focus();
             if (isTextField) {
               const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
               const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
               setter.call(el, text);
               el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            } else if (el.isContentEditable && el.classList.contains('ql-editor')) {
+              // 실측은 하이드레이션 뒤 정규화 내용 불일치뿐이다. 추정 원인(미확인): Quill(Gemini)이 블록 안
+              // 형제가 있는 <br>를 정리해 줄바꿈을 잃거나, HTML 문자열 싱크(insertHTML)가 Trusted Types
+              // 문서에서 예외를 던진다. 어느 경우든 먼저 타이핑과 같은 네이티브
+              // 편집 명령(insertText: 줄바꿈은 문단 분리)으로 넣고, 정규화한 전체 내용이 다르면 Quill 의
+              // 문단 구조(<p>줄</p>, 빈 줄 <p><br></p>)를 DOM API로 만들어 교체한다. 그래도 다르면 실패다.
+              const selection = window.getSelection();
+              const range = document.createRange();
+              range.selectNodeContents(el);
+              selection.removeAllRanges();
+              selection.addRange(range);
+              let typed = false;
+              try { typed = document.execCommand('insertText', false, text); } catch (_) { typed = false; }
+              if (!typed || normalizedPromptText(el.innerText) !== normalizedPromptText(text)) {
+                el.replaceChildren(...quillParagraphs(text));
+                el.dispatchEvent(new InputEvent('input', {
+                  bubbles: true,
+                  inputType: 'insertText',
+                  data: text
+                }));
+              }
+              if (normalizedPromptText(el.innerText) !== normalizedPromptText(text)) return false;
               el.dispatchEvent(new Event('change', { bubbles: true }));
             } else if (el.isContentEditable) {
               const selection = window.getSelection();
@@ -2648,12 +2903,14 @@ private enum ExternalAIBrowserScripts {
               selection.addRange(range);
               // insertText 는 macOS 스마트 따옴표 등이 구조화된 입력을 바꿀 수 있어,
               // 리터럴 HTML 이스케이프(& < >, CR/LF→br) 후 insertHTML 로 넣는다.
+              // 런타임·Android 와 같이 예외(원인 미확인, 예: Trusted Types)는 삽입 실패로 보고 아래 폴백을 쓴다.
               const html = String(text)
                 .replace(/&/g, '&amp;')
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;')
                 .replace(/\\r\\n|\\r|\\n/g, '<br>');
-              const inserted = document.execCommand('insertHTML', false, html);
+              let inserted = false;
+              try { inserted = document.execCommand('insertHTML', false, html); } catch (_) { inserted = false; }
               if (!inserted) {
                 el.replaceChildren(document.createTextNode(text));
                 el.dispatchEvent(new InputEvent('input', {
@@ -2670,11 +2927,39 @@ private enum ExternalAIBrowserScripts {
             return true;
           };
 
+          // Gemini 전용 첫 전송 전 안정성. 실측: 채우기 뒤 26/96ms 만에 누른 실행은 제공사 화면이 119초 동안
+          // 생성 표시만 띄웠고, 644ms 뒤 누른 실행은 완료됐다. 추정(미확인): DOM 문구 일치가 편집기 모델 반영보다 앞선다.
+          // 그래서 문서 complete, 같은 연결된 편집기·유일한 활성 전송 버튼·같은 원문·같은 첨부 수가 기존 폴링 차례
+          // geminiSendStableSamples번 연속, geminiSendStableMs 이상 유지될 때만 처음 클릭한다. 별도 대기는 없다.
+          // 어느 조건이든 한 번 어긋나거나 다시 채우면(새 문서는 이 스크립트가 새로 설치됨) 처음부터 다시 센다.
+          const geminiSendStableSamples = 3;
+          const geminiSendStableMs = 900;
+          let sendReadiness = null;
+
+          function sendCandidateCountInScope() {
+            const scope = composerScope();
+            const found = [];
+            if (!scope) return 0;
+            for (const selector of sendSelectors) {
+              try {
+                for (const button of scope.querySelectorAll(selector)) {
+                  if (found.includes(button) || !isVisible(button)) continue;
+                  const meaning = ((button.getAttribute('aria-label') || '') + ' ' + (button.getAttribute('data-testid') || '')).toLowerCase();
+                  if (/stop|중지|정지|voice|음성/.test(meaning)) continue;
+                  found.push(button);
+                }
+              } catch (e) {}
+            }
+            return found.length;
+          }
+
           window.__starManagerSendPrompt = function() {
             // The same DOM button may become Stop after the first click. Never click it
             // again while waiting for proof, and never turn a consumed image request into text-only.
             if (window.__starManagerSubmitDispatched) return true;
-            if (isGeneratingNow()) return false;
+            const previousReadiness = sendReadiness;
+            sendReadiness = null;
+            if (generationSeen()) return false;
             const input = queryEditor();
             const button = sendButton();
             if (!input || !button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
@@ -2683,6 +2968,25 @@ private enum ExternalAIBrowserScripts {
             if (!current || current !== normalize(window.__starManagerLastFilled || '')) return false;
             const rect = button.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return false;
+            let stableSamples = 0;
+            if (isGeminiProvider) {
+              if (document.readyState !== 'complete' || sendCandidateCountInScope() > 1) return false;
+              const isTextField = input.tagName === 'TEXTAREA' || input.tagName === 'INPUT';
+              const editorLive = input.isConnected && button.isConnected
+                && (isTextField ? !input.disabled && !input.readOnly : input.isContentEditable);
+              if (!editorLive) return false;
+              const raw = String(input.value || input.innerText || input.textContent || '');
+              const attachments = attachmentCount();
+              const now = Date.now();
+              const unchanged = !!previousReadiness
+                && previousReadiness.editor === input && previousReadiness.button === button
+                && previousReadiness.raw === raw && previousReadiness.attachments === attachments;
+              sendReadiness = unchanged
+                ? { editor: input, button: button, raw: raw, attachments: attachments, since: previousReadiness.since, samples: previousReadiness.samples + 1 }
+                : { editor: input, button: button, raw: raw, attachments: attachments, since: now, samples: 1 };
+              if (sendReadiness.samples < geminiSendStableSamples || now - sendReadiness.since < geminiSendStableMs) return false;
+              stableSamples = sendReadiness.samples;
+            }
 
             window.__starManagerSubmitAttempts = (window.__starManagerSubmitAttempts || 0) + 1;
             const attempt = window.__starManagerSubmitAttempts;
@@ -2694,7 +2998,8 @@ private enum ExternalAIBrowserScripts {
             input.focus();
             button.focus();
             button.click();
-            return true;
+            // Gemini 는 클릭 전 연속 안정 표본 수(숫자, 문구 아님)를 돌려 send_attempted 진단에 남긴다.
+            return isGeminiProvider ? stableSamples : true;
           };
 
           window.__starManagerDidSubmit = function() {
@@ -2771,11 +3076,34 @@ private enum ExternalAIBrowserScripts {
           let lastText = '';
           let stableTicks = 0;
 
+          // __starManagerSendPrompt 와 같은 공백 정규화로, 넣은 문구가 작성창에 그대로 있는지만 0/1로 보고한다.
+          // prompt_length 는 textContent 기준이라 insertHTML 의 <br> 줄바꿈을 세지 않는다. 문구 자체는 보내지 않는다.
+          function promptMatchesLastFilled(editor) {
+            const expected = window.__starManagerLastFilled;
+            if (!editor || !expected) return false;
+            const normalize = value => String(value || '').replace(/\\s+/g, ' ').trim();
+            return normalize(editor.value || editor.innerText || editor.textContent) === normalize(expected);
+          }
+
+          // 전송 시도 전 재입력 판단용 숫자 상태(문구는 돌려주지 않는다).
+          // 3: 전송 클릭됨 또는 이 문서에서 생성 표시를 봄(재입력 금지), 0: 문서 로드 미완료/입력창 없음/아직 채우지 않음,
+          // 1: 넣은 문구와 일치, 2: 로드가 끝난 실제 입력창의 내용이 넣은 문구와 달라짐(교체·정규화).
+          window.__starManagerPromptState = function() {
+            if (window.__starManagerSubmitDispatched || generationSeen()) return 3;
+            if (document.readyState !== 'complete' || !window.__starManagerLastFilled) return 0;
+            const editor = queryEditor();
+            if (!editor) return 0;
+            const isTextField = editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT';
+            if (!isTextField && !editor.isContentEditable) return 0;
+            return promptMatchesLastFilled(editor) ? 1 : 2;
+          };
+
           setInterval(function() {
             const editor = queryEditor();
             const scope = composerScope();
             const send = sendButton();
             window.webkit.messageHandlers.starManagerBridge.postMessage({diagnosticEvent:'bridge_snapshot', metrics: {
+              prompt_present: promptMatchesLastFilled(editor) ? 1 : 0,
               preview_count: attachmentCount(), input_count: document.querySelectorAll('input[type=file]').length,
               uploading_count: scope ? Array.from(scope.querySelectorAll('[role=progressbar], [aria-busy=true], .animate-spin')).filter(isVisible).length : 0,
               composer_present: editor ? 1 : 0, send_present: send ? 1 : 0,
@@ -2934,6 +3262,170 @@ private enum ExternalAIBrowserScripts {
             return JSON.stringify({ authenticated: false, hasLogin: false, hasChallenge: false });
           } catch (e) {
             return JSON.stringify({ authenticated: false, hasLogin: false, hasChallenge: false, error: e.message || String(e) });
+          }
+        })();
+        """
+    }
+
+    /// 접힌 모바일 사이드바를 여는 스크립트가 있는 제공사만 값을 돌려준다.
+    /// `allowStatelessToggle`은 Claude에만 쓰인다(ChatGPT 스크립트는 그대로).
+    static func openSidebarScript(for provider: ExternalAIProvider, allowStatelessToggle: Bool) -> String? {
+        switch provider {
+        case .openAI: openChatGPTSidebarScript()
+        case .claude: openClaudeSidebarScript(allowStatelessToggle: allowStatelessToggle)
+        case .gemini, .grok: nil
+        }
+    }
+
+    // Claude 사이드바 컨트롤의 정확한 의미 표지(소문자·공백 정규화 후 완전 일치). 실기기 DOM 속성은
+    // 아직 관찰하지 못한 가설이며, 일반 메뉴·햄버거 이름은 여기에 넣지 않는다.
+    private static let claudeSidebarOpenLabels = [
+        "open sidebar", "show sidebar", "expand sidebar",
+        "사이드바 열기", "사이드바 보기", "사이드바 표시", "사이드바 펼치기"
+    ]
+    private static let claudeSidebarToggleLabels = [
+        "toggle sidebar", "sidebar", "사이드바 토글", "사이드바", "사이드바 표시/숨기기", "사이드바 열기/닫기"
+    ]
+    private static let claudeSidebarCloseLabels = [
+        "close sidebar", "hide sidebar", "collapse sidebar", "사이드바 닫기", "사이드바 숨기기", "사이드바 접기"
+    ]
+    private static let claudeSidebarToggleTestIDs = [
+        "sidebar-toggle", "mobile-sidebar-toggle", "toggle-sidebar", "open-sidebar-button",
+        "sidebar-toggle-button", "sidebar-open-button"
+    ]
+    // 고정(pin)은 저장되는 사용자 설정을 바꿀 수 있어 누르지 않는다(개수만 진단).
+    private static let claudeSidebarPinMarkers = [
+        "pin-sidebar-toggle", "pin sidebar", "unpin sidebar", "사이드바 고정", "사이드바 고정 해제"
+    ]
+
+    /// Claude 사이드바 표지 분류(열기 스크립트와 개수 스크립트가 같은 규칙을 쓴다).
+    private static func claudeSidebarClassifierJS() -> String {
+        """
+            function isVisible(el) {
+              if (!el) return false;
+              if (el.closest("[aria-hidden='true'], [inert]")) return false;
+              for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+                const style = window.getComputedStyle(node);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                if (node.hidden) return false;
+              }
+              const rect = el.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            }
+            const openLabels = \(jsArray(claudeSidebarOpenLabels));
+            const toggleLabels = \(jsArray(claudeSidebarToggleLabels));
+            const closeLabels = \(jsArray(claudeSidebarCloseLabels));
+            const toggleTestIds = \(jsArray(claudeSidebarToggleTestIDs));
+            const pinMarkers = \(jsArray(claudeSidebarPinMarkers));
+            function norm(value) { return String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase(); }
+            function anyIn(list, values) { return values.some(function(v) { return v && list.indexOf(v) !== -1; }); }
+            function classify(el) {
+              const names = [norm(el.getAttribute('aria-label')), norm(el.getAttribute('title'))];
+              const testid = norm(el.getAttribute('data-testid'));
+              return {
+                open: anyIn(openLabels, names),
+                toggle: anyIn(toggleLabels, names),
+                close: anyIn(closeLabels, names),
+                testid: anyIn(toggleTestIds, [testid]),
+                pin: anyIn(pinMarkers, names.concat([testid])),
+                controls: /(^|[-_ ])sidebar([-_ ]|$)/.test(norm(el.getAttribute('aria-controls')))
+              };
+            }
+            function isSidebarControl(c) { return c.open || c.toggle || c.close || c.testid || c.pin || c.controls; }
+            function sidebarControls() { return Array.from(document.querySelectorAll("button, [role='button']")); }
+        """
+    }
+
+    /// Claude 모바일의 접힌 사이드바 안에 계정 메뉴(`user-menu-button`)가 있어 사용자가 손으로
+    /// 열어야만 로그인이 인식된다(실기기: 왼쪽 위 컨트롤 한 번으로 인식). 그 컨트롤의 정적 속성은
+    /// 아직 관찰하지 못했으므로(가설) 정확한 사이드바 표지(aria-label·title 완전 일치, data-testid
+    /// 완전 일치, 이름에 sidebar 토큰이 있는 aria-controls) 중 보이는·활성 후보가 정확히 하나이고,
+    /// 보이는 닫기 컨트롤이 없을 때만 누른다. 숨김/inert 사본, 펼침(aria-expanded=true), 비활성,
+    /// 고정(pin), 후보 여럿, 일반 메뉴·햄버거는 누르지 않는다. `aria-expanded='false'`가 명시된
+    /// 컨트롤(kind 1)만 호출자의 제한 횟수 안에서 다시 누를 수 있고, 상태를 밝히지 않는 토글·열기
+    /// 이름(kind 2)은 문서 로드가 끝난 뒤 호출자가 허락할 때 페이지당 한 번만 누른다(열고 닫기 반복 방지).
+    /// aria-controls만 일치하는 컨트롤은 닫힘 상태가 명시돼야 한다. 편집기 존재로 인증을 추론하지 않는다.
+    static func openClaudeSidebarScript(allowStatelessToggle: Bool) -> String {
+        """
+        (function() {
+          try {
+        \(claudeSidebarClassifierJS())
+            const allowStatelessToggle = \(allowStatelessToggle ? "true" : "false");
+            let closeVisible = false;
+            const visible = [];
+            for (const el of sidebarControls()) {
+              const c = classify(el);
+              if (!isSidebarControl(c) || !isVisible(el)) continue;
+              if (c.close) { closeVisible = true; continue; }
+              if (c.pin) continue;
+              visible.push({ el: el, c: c });
+            }
+            if (closeVisible || visible.length !== 1) return JSON.stringify({ clicked: false });
+            const target = visible[0].el;
+            const c = visible[0].c;
+            if (target.disabled || target.getAttribute('aria-disabled') === 'true') return JSON.stringify({ clicked: false });
+            const expanded = target.getAttribute('aria-expanded');
+            if (expanded === 'true') return JSON.stringify({ clicked: false });
+            let kind = 0;
+            if (expanded === 'false') {
+              kind = 1;
+            } else if ((c.open || c.toggle || c.testid) && allowStatelessToggle && document.readyState === 'complete') {
+              kind = 2;
+            }
+            if (kind === 0) return JSON.stringify({ clicked: false });
+            target.click();
+            return JSON.stringify({ clicked: true, kind: kind });
+          } catch (e) {
+            return JSON.stringify({ clicked: false });
+          }
+        })();
+        """
+    }
+
+    /// 읽기 전용 진단: 위 분류의 범주별 보이는 개수와 숨은 사본 수, 그리고 누르지 않는 일반 메뉴 이름
+    /// 개수만 정수로 돌려준다. 클릭·문구·속성값·DOM은 돌려주지 않는다.
+    static func claudeSidebarControlCountsScript() -> String {
+        """
+        (function() {
+          try {
+        \(claudeSidebarClassifierJS())
+            const menuLabels = ['menu', 'open menu', 'main menu', 'navigation menu', '메뉴', '메뉴 열기'];
+            const counts = {
+              sidebar_open_label_count: 0, sidebar_toggle_label_count: 0, sidebar_close_label_count: 0,
+              sidebar_testid_count: 0, sidebar_pin_count: 0, sidebar_controls_count: 0,
+              sidebar_named_count: 0, sidebar_hidden_count: 0, sidebar_candidate_count: 0,
+              menu_label_count: 0, sidebar_expanded: 3, document_complete: document.readyState === 'complete' ? 1 : 0
+            };
+            const candidates = [];
+            for (const el of sidebarControls()) {
+              const c = classify(el);
+              const names = [norm(el.getAttribute('aria-label')), norm(el.getAttribute('title'))];
+              const named = names.concat([norm(el.getAttribute('data-testid')), norm(el.getAttribute('aria-controls'))])
+                .some(function(v) { return v.includes('sidebar') || v.includes('사이드바'); });
+              const shown = isVisible(el);
+              if (!shown) {
+                if (isSidebarControl(c)) counts.sidebar_hidden_count += 1;
+                continue;
+              }
+              if (c.open) counts.sidebar_open_label_count += 1;
+              if (c.toggle) counts.sidebar_toggle_label_count += 1;
+              if (c.close) counts.sidebar_close_label_count += 1;
+              if (c.testid) counts.sidebar_testid_count += 1;
+              if (c.pin) counts.sidebar_pin_count += 1;
+              if (c.controls) counts.sidebar_controls_count += 1;
+              if (named) counts.sidebar_named_count += 1;
+              if (anyIn(menuLabels, names)) counts.menu_label_count += 1;
+              if (isSidebarControl(c) && !c.close && !c.pin) candidates.push(el);
+            }
+            counts.sidebar_candidate_count = candidates.length;
+            if (candidates.length === 1) {
+              const expanded = candidates[0].getAttribute('aria-expanded');
+              counts.sidebar_expanded = expanded === 'false' ? 1 : (expanded === 'true' ? 2 : 0);
+            }
+            Object.keys(counts).forEach(function(key) { counts[key] = Math.min(counts[key], 100); });
+            return JSON.stringify(counts);
+          } catch (e) {
+            return JSON.stringify({});
           }
         })();
         """
