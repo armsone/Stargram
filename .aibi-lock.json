@@ -15,7 +15,7 @@
       }
     },
     "imanager-ios": {
-      "version": "0.5.5",
+      "version": "0.5.6",
       "files": {
         "iManagerAI/Features/Composer/AIBIMediaPipeline.swift": {
           "sha256": "8e9c934a73bd0a2bc06676e532cdd23dc0a320d96c9cdf922af813668c946dc7",
@@ -33,5 +33,5 @@
     }
   },
   "consumer": "imanager",
-  "aibiVersion": "0.5.5"
+  "aibiVersion": "0.5.6"
 }
